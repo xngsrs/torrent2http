@@ -4,6 +4,8 @@
 *.so
 
 # Folders
+.idea
+build
 _obj
 _test
 

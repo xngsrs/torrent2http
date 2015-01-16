@@ -21,6 +21,7 @@ type TorrentFS struct {
 	lastOpenedFile    *TorrentFile
 	shuttingDown	  bool
 	fileCounter		  int
+	progresses		  lt.StdVectorSizeType
 }
 
 type TorrentFile struct {
@@ -126,18 +127,18 @@ func (tfs *TorrentFS) TorrentInfo() lt.TorrentInfo {
 	return tfs.info
 }
 
-func (tfs *TorrentFS) Files(withProgress bool) []*TorrentFile {
+func (tfs *TorrentFS) LoadFileProgress() {
+	tfs.progresses = lt.NewStdVectorSizeType()
+	tfs.handle.FileProgress(tfs.progresses, int(lt.TorrentHandlePieceGranularity))
+}
+
+func (tfs *TorrentFS) Files() []*TorrentFile {
 	info := tfs.TorrentInfo()
 	files := make([]*TorrentFile, info.NumFiles())
-	var progresses lt.StdVectorSizeType
-	if withProgress {
-		progresses = lt.NewStdVectorSizeType()
-		tfs.handle.FileProgress(progresses, int(lt.TorrentHandlePieceGranularity))
-	}
 	for i := 0; i < info.NumFiles(); i++ {
 		file, _ := tfs.FileAt(i)
-		if withProgress {
-			file.downloaded = progresses.Get(i)
+		if tfs.progresses != nil && !tfs.progresses.Empty() {
+			file.downloaded = tfs.progresses.Get(i)
 			file.progress = float32(file.downloaded)/float32(file.Size())
 		}
 		files[i] = file
@@ -166,7 +167,7 @@ func (tfs *TorrentFS) FileAt(index int) (*TorrentFile, error) {
 
 func (tfs *TorrentFS) FileByName(name string) (*TorrentFile, error) {
 	savePath, _ := filepath.Abs(path.Join(tfs.SavePath(), name))
-	for _, file := range tfs.Files(false) {
+	for _, file := range tfs.Files() {
 		if file.SavePath() == savePath {
 			return file, nil
 		}
@@ -353,11 +354,8 @@ func (tf *TorrentFile) Read(data []byte) (int, error) {
 	readOffset := tf.readOffset()
 	startPiece, _ := tf.pieceFromOffset(readOffset)
 	endPiece, _ := tf.pieceFromOffset(readOffset + int64(toRead))
-	if err := tf.waitForPiece(startPiece); err != nil {
-		return 0, err
-	}
-	if endPiece != startPiece {
-		if err := tf.waitForPiece(endPiece); err != nil {
+	for i := startPiece; i <= endPiece; i++ {
+		if err := tf.waitForPiece(i); err != nil {
 			return 0, err
 		}
 	}

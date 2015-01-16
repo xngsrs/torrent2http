@@ -1,4 +1,5 @@
-CC = gcc
+CC = cc
+CXX = c++
 PLATFORMS = android-arm \
 	darwin-x64 \
 	linux-x86 \
@@ -32,29 +33,24 @@ endif
 ifeq ($(TARGET_OS), windows)
 	EXT = .exe
 	GOOS = windows
-	LDFLAGS = "-extld=$(CC)"
+	LDFLAGS := $(LDFLAGS) -extld=$(CC)
 else ifeq ($(TARGET_OS), darwin)
 	EXT =
 	GOOS = darwin
-	CC = $(CROSS_TRIPLE)-cc
-	LDFLAGS = "-linkmode=external -extld=$(CC) -extldflags=-lstdc++"
+	LDFLAGS := $(LDFLAGS) -linkmode=external -extld=$(CC) -extldflags=-lstdc++
 else ifeq ($(TARGET_OS), linux)
 	EXT =
 	GOOS = linux
-	LDFLAGS = "-linkmode=external -extld=$(CC) -extldflags=-lstdc++ -extldflags=-lrt"
+	LDFLAGS := $(LDFLAGS) -linkmode=external -extld=$(CC) -extldflags=-lstdc++ -extldflags=-lrt
 else ifeq ($(TARGET_OS), android)
 	EXT =
 	GOOS = android
 	GOARM = 7
-	LDFLAGS = "-linkmode=external -extld=$(CC) -extldflags=-lstdc++"
+	LDFLAGS := $(LDFLAGS) -linkmode=external -extld=$(CC) -extldflags=-lstdc++
 endif
 
 NAME = torrent2http
 GO = go
-GIT = git
-GIT_VERSION = $(shell $(GIT) describe --always)
-VERSION = $(patsubst v%,%,$(GIT_VERSION))
-ZIP_FILE = $(ADDON_NAME)-$(VERSION).zip
 CGO_ENABLED = 1
 OUTPUT_NAME = $(NAME)$(EXT)
 BUILD_PATH = build/$(TARGET_OS)_$(TARGET_ARCH)
@@ -65,13 +61,13 @@ LIBRARY_PATH = $(GOPATH)/pkg/$(GOOS)_$(GOARCH)/$(GO_PACKAGE_NS)
 all: $(PLATFORMS)
 
 $(PLATFORMS):
-	$(DOCKER) run -i --rm -v $(HOME):$(HOME) -t -e GOPATH=$(GOPATH) -w $(shell pwd) $(DOCKER_IMAGE):$@ make clean dist;
+	$(DOCKER) run -i --rm -v $(HOME):$(HOME) -v /tmp:/tmp -t -e GOPATH=$(GOPATH) -w $(shell pwd) $(DOCKER_IMAGE):$@ make clean dist;
 
 $(BUILD_PATH):
 	mkdir -p $(BUILD_PATH)
 
 $(BUILD_PATH)/$(OUTPUT_NAME): $(BUILD_PATH)
-	CC=$(CC) GOOS=$(GOOS) GOARCH=$(GOARCH) GOARM=$(GOARM) CGO_ENABLED=$(CGO_ENABLED) $(GO) build -v -x -o $(BUILD_PATH)/$(OUTPUT_NAME) -ldflags=$(LDFLAGS)
+	CC=$(CC) GOOS=$(GOOS) GOARCH=$(GOARCH) GOARM=$(GOARM) CGO_ENABLED=$(CGO_ENABLED) $(GO) build -v -x -o $(BUILD_PATH)/$(OUTPUT_NAME) -ldflags="$(LDFLAGS)"
 
 vendor_libs_darwin:
 

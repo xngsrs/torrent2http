@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"net"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -18,9 +19,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/grafov/bcast"
 	lt "github.com/anteo/libtorrent-go"
-	tomb "gopkg.in/tomb.v2"
 )
 
 type FileStatusInfo struct {
@@ -106,11 +105,12 @@ type Config struct {
 	enableNATPMP            bool
 	enableUTP               bool
 	enableTCP               bool
+	exitOnFinish			bool
 	dhtRouters              string
 	trackers                string
 }
 
-const VERSION = "1.0.0"
+const VERSION = "1.0.1"
 const USER_AGENT = "torrent2http/"+VERSION+" libtorrent/"+lt.LIBTORRENT_VERSION
 
 var (
@@ -118,10 +118,8 @@ var (
 	session lt.Session
 	torrentHandle lt.TorrentHandle
 	torrentFS *TorrentFS
-	alerts *bcast.Group
-	statsTomb *tomb.Tomb
-	alertsTomb *tomb.Tomb
-	logAlertsTomb *tomb.Tomb
+	forceShutdown chan bool
+	httpListener net.Listener
 )
 
 const (
@@ -174,46 +172,39 @@ func statusHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Write(output)
 }
 
-func stats() (error) {
-	for {
-		select {
-		case <-time.After(5*time.Second):
-			status := torrentHandle.Status()
-			if !status.GetHasMetadata() {
-				continue
-			}
-			if config.showAllStats || config.showOverallProgress {
-				sessionStatus := session.Status()
-				dhtStatusStr := ""
-				if session.IsDhtRunning() {
-					dhtStatusStr = fmt.Sprintf(", DHT nodes: %d", sessionStatus.GetDhtNodes())
-				}
-				errorStr := ""
-				if len(status.GetError()) > 0 {
-					errorStr = fmt.Sprintf(" (%s)", status.GetError())
-				}
-				log.Printf("%s, overall progress: %.2f%%, dl/ul: %.3f/%.3f kbps, peers/seeds: %d/%d" + dhtStatusStr + errorStr,
-					strings.Title(stateStrings[int(status.GetState())]),
-						status.GetProgress()*100,
-						float32(status.GetDownloadRate())/1024,
-						float32(status.GetUploadRate())/1024,
-					status.GetNumPeers(),
-					status.GetNumSeeds(),
-				)
-			}
-			if config.showFilesProgress || config.showAllStats {
-				str := "Files: "
-				for i, f := range torrentFS.Files(true) {
-					str += fmt.Sprintf("[%d] %.2f%% ", i, f.Progress()*100)
-				}
-				log.Println(str)
-			}
-			if (config.showPiecesProgress || config.showAllStats) && torrentFS.LastOpenedFile() != nil {
-				torrentFS.LastOpenedFile().ShowPieces()
-			}
-		case <-statsTomb.Dying():
-			return nil
+func stats() {
+	status := torrentHandle.Status()
+	if !status.GetHasMetadata() {
+		return
+	}
+	if config.showAllStats || config.showOverallProgress {
+		sessionStatus := session.Status()
+		dhtStatusStr := ""
+		if session.IsDhtRunning() {
+			dhtStatusStr = fmt.Sprintf(", DHT nodes: %d", sessionStatus.GetDhtNodes())
 		}
+		errorStr := ""
+		if len(status.GetError()) > 0 {
+			errorStr = fmt.Sprintf(" (%s)", status.GetError())
+		}
+		log.Printf("%s, overall progress: %.2f%%, dl/ul: %.3f/%.3f kbps, peers/seeds: %d/%d" + dhtStatusStr + errorStr,
+			strings.Title(stateStrings[int(status.GetState())]),
+				status.GetProgress()*100,
+				float32(status.GetDownloadRate())/1024,
+				float32(status.GetUploadRate())/1024,
+			status.GetNumPeers(),
+			status.GetNumSeeds(),
+		)
+	}
+	if config.showFilesProgress || config.showAllStats {
+		str := "Files: "
+		for i, f := range torrentFS.Files() {
+			str += fmt.Sprintf("[%d] %.2f%% ", i, f.Progress()*100)
+		}
+		log.Println(str)
+	}
+	if (config.showPiecesProgress || config.showAllStats) && torrentFS.LastOpenedFile() != nil {
+		torrentFS.LastOpenedFile().ShowPieces()
 	}
 }
 
@@ -223,7 +214,7 @@ func lsHandler(w http.ResponseWriter, _ *http.Request) {
 	retFiles := LsInfo{}
 
 	if torrentFS.HasTorrentInfo() {
-		for _, file := range torrentFS.Files(true) {
+		for _, file := range torrentFS.Files() {
 			url := url.URL{
 				Scheme:    "http",
 				Host:      config.bindAddress,
@@ -276,7 +267,7 @@ func peersHandler(w http.ResponseWriter, _ *http.Request) {
 func filesToRemove() []string {
 	var files []string
 	if torrentFS.HasTorrentInfo() {
-		for _, file := range torrentFS.Files(true) {
+		for _, file := range torrentFS.Files() {
 			if (!config.keepComplete || !file.IsComplete()) && (!config.keepIncomplete || file.IsComplete()) {
 				if _, err := os.Stat(file.SavePath()); !os.IsNotExist(err) {
 					files = append(files, file.SavePath())
@@ -312,16 +303,20 @@ func removeFiles(files [] string) {
 	}
 }
 
-func waitForAlert(receiver *bcast.Member, name string, timeout time.Duration) lt.Alert {
+func waitForAlert(name string, timeout time.Duration) lt.Alert {
+	start := time.Now()
 	for {
-		select {
-		case alert := <-receiver.In:
-			ltAlert := alert.(lt.Alert)
-			if ltAlert.What() == name {
-				return ltAlert
+		for {
+			alert := session.WaitForAlert(lt.Milliseconds(100))
+			if time.Now().Sub(start) > timeout {
+				return nil
 			}
-		case <-time.After(timeout):
-			return nil
+			if alert.Swigcptr() != 0 {
+				alert = popAlert(false)
+				if alert.What() == name {
+					return alert
+				}
+			}
 		}
 	}
 }
@@ -339,32 +334,27 @@ func removeTorrent() {
 		}
 	}
 	log.Println("Removing the torrent")
-	receiver := alerts.Join()
 	session.RemoveTorrent(torrentHandle, flag)
 	if flag != 0 || len(files) > 0 {
 		log.Println("Waiting for files to be removed")
-		waitForAlert(receiver, "cache_flushed_alert", 15*time.Second)
+		waitForAlert("cache_flushed_alert", 15*time.Second)
 		removeFiles(files)
 	}
 }
 
-func saveResumeData() {
+func saveResumeData(async bool) bool {
 	if !torrentHandle.Status().GetNeedSaveResume() || config.resumeFile == "" {
-		return
+		return false
 	}
-	receiver := alerts.Join()
 	torrentHandle.SaveResumeData(3)
-	alert := waitForAlert(receiver, "save_resume_data_alert", 5*time.Second)
-	if alert == nil {
-		return
+	if !async {
+		alert := waitForAlert("save_resume_data_alert", 5*time.Second)
+		if alert == nil {
+			return false
+		}
+		processSaveResumeDataAlert(alert)
 	}
-	saveResumeDataAlert := lt.SwigcptrSaveResumeDataAlert(alert.Swigcptr())
-	log.Printf("Saving resume data to: %s", config.resumeFile)
-	data := lt.Bencode(saveResumeDataAlert.ResumeData())
-	err := ioutil.WriteFile(config.resumeFile, []byte(data), 0644)
-	if err != nil {
-		log.Println(err)
-	}
+	return true
 }
 
 func saveSessionState() {
@@ -384,22 +374,15 @@ func saveSessionState() {
 func shutdown() {
 	log.Println("Stopping torrent2http...")
 	torrentFS.Shutdown()
-	statsTomb.Kill(nil)
-	statsTomb.Wait()
 	if session != nil {
-		receiver := alerts.Join()
 		session.Pause()
-		waitForAlert(receiver, "torrent_paused_alert", 10*time.Second)
+		waitForAlert("torrent_paused_alert", 10*time.Second)
 		if torrentHandle != nil {
-			saveResumeData()
+			saveResumeData(false)
 			saveSessionState()
 			removeTorrent()
 		}
 		log.Println("Aborting the session")
-		logAlertsTomb.Kill(nil)
-		logAlertsTomb.Wait()
-		alertsTomb.Kill(nil)
-		alertsTomb.Wait()
 		lt.DeleteSession(session)
 	}
 	log.Println("Bye bye")
@@ -421,6 +404,7 @@ func parseFlags() {
 	flag.BoolVar(&config.showFilesProgress, "files-progress", false, "Show files progress")
 	flag.BoolVar(&config.showPiecesProgress, "pieces-progress", false, "Show pieces progress")
 	flag.BoolVar(&config.debugAlerts, "debug-alerts", false, "Show debug alert notifications")
+	flag.BoolVar(&config.exitOnFinish, "exit-on-finish", false, "Exit when download finished")
 
 	flag.StringVar(&config.resumeFile, "resume-file", "", "Use fast resume file")
 	flag.StringVar(&config.stateFile, "state-file", "", "Use file for saving/restoring session state")
@@ -476,7 +460,7 @@ func inactiveAutoShutdown(connTrackChannel chan int) {
 			case inc := <-connTrackChannel:
 				activeConnections += inc
 			case <-time.After(time.Duration(config.idleTimeout) * time.Second):
-				go shutdown()
+				forceShutdown <- true
 			}
 		} else {
 			activeConnections += <-connTrackChannel
@@ -508,8 +492,8 @@ func startHTTP() {
 	mux.HandleFunc("/peers", peersHandler)
 	mux.Handle("/get/", http.StripPrefix("/get/", getHandler(http.FileServer(torrentFS))))
 	mux.HandleFunc("/shutdown", func(w http.ResponseWriter, _ *http.Request) {
-		go shutdown()
 		fmt.Fprintf(w, "OK")
+		forceShutdown <- true
 	})
 	mux.Handle("/files/", http.StripPrefix("/files/", http.FileServer(torrentFS)))
 
@@ -521,84 +505,68 @@ func startHTTP() {
 	}
 
 	log.Printf("Listening HTTP on %s...\n", config.bindAddress)
-	err := http.ListenAndServe(config.bindAddress, handler)
-	if err != nil {
-		log.Fatal(err)
+	s := &http.Server{
+		Addr: config.bindAddress,
+		Handler: handler,
 	}
+
+	var e error
+	if httpListener, e = net.Listen("tcp", config.bindAddress); e != nil {
+		log.Fatal(e)
+	}
+	go s.Serve(httpListener)
 }
 
-func broadcastAlerts() {
-	for {
-		alerts.Broadcasting(5 * time.Second)
+func popAlert(logAlert bool) lt.Alert {
+	alert := session.PopAlert()
+	if alert.Swigcptr() == 0 {
+		return nil
 	}
-}
-
-func consumeAlerts() error {
-	for {
-		select {
-		case <-time.After(time.Second):
-			for {
-				alert := session.PopAlert()
-				if alert.Swigcptr() == 0 {
-					break
-				}
-				alerts.Send(alert)
-			}
-		case <-alertsTomb.Dying():
-			return nil
-		}
-	}
-}
-
-func logAlerts() error {
-	receiver := alerts.Join()
-	for {
-		select {
-		case msg := <-receiver.In:
-			alert := msg.(lt.Alert)
-			str := ""
-			switch alert.What() {
-			case "tracker_error_alert":
-				str = lt.SwigcptrTrackerErrorAlert(alert.Swigcptr()).GetMsg()
-				break
-			case "tracker_warning_alert":
-				str = lt.SwigcptrTrackerWarningAlert(alert.Swigcptr()).GetMsg()
-				break
-			case "scrape_failed_alert":
-				str = lt.SwigcptrScrapeFailedAlert(alert.Swigcptr()).GetMsg()
-				break
-			case "url_seed_alert":
-				str = lt.SwigcptrUrlSeedAlert(alert.Swigcptr()).GetMsg()
-				break
-			}
-			if str != "" {
-				log.Printf("(%s) %s: %s", alert.What(), alert.Message(), str)
-			} else {
-				log.Printf("(%s) %s", alert.What(), alert.Message())
-			}
-		case <-logAlertsTomb.Dying():
-			return nil
-		}
-	}
-}
-
-func watchParent() {
-	for {
-		// did the parent die? shutdown!
-		if os.Getppid() == 1 {
-			go shutdown()
+	if logAlert {
+		str := ""
+		switch alert.What() {
+		case "tracker_error_alert":
+			str = lt.SwigcptrTrackerErrorAlert(alert.Swigcptr()).GetMsg()
+			break
+		case "tracker_warning_alert":
+			str = lt.SwigcptrTrackerWarningAlert(alert.Swigcptr()).GetMsg()
+			break
+		case "scrape_failed_alert":
+			str = lt.SwigcptrScrapeFailedAlert(alert.Swigcptr()).GetMsg()
+			break
+		case "url_seed_alert":
+			str = lt.SwigcptrUrlSeedAlert(alert.Swigcptr()).GetMsg()
 			break
 		}
-		time.Sleep(2 * time.Second)
+		if str != "" {
+			log.Printf("(%s) %s: %s", alert.What(), alert.Message(), str)
+		} else {
+			log.Printf("(%s) %s", alert.What(), alert.Message())
+		}
+	}
+	return alert
+}
+
+func processSaveResumeDataAlert(alert lt.Alert) {
+	saveResumeDataAlert := lt.SwigcptrSaveResumeDataAlert(alert.Swigcptr())
+	log.Printf("Saving resume data to: %s", config.resumeFile)
+	data := lt.Bencode(saveResumeDataAlert.ResumeData())
+	err := ioutil.WriteFile(config.resumeFile, []byte(data), 0644)
+	if err != nil {
+		log.Println(err)
 	}
 }
 
-// Handle SIGTERM (Ctrl-C)
-func handleSignals() {
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
-	<-signalChan
-	go shutdown()
+func consumeAlerts() {
+	for {
+		var alert lt.Alert
+		if alert = popAlert(true); alert == nil {
+			break
+		}
+		if alert.What() == "save_resume_data_alert" {
+			processSaveResumeDataAlert(alert)
+		}
+	}
 }
 
 func buildTorrentParams(uri string) lt.AddTorrentParams {
@@ -813,31 +781,48 @@ func addTorrent(torrentParams lt.AddTorrentParams) {
 	torrentFS = NewTorrentFS(torrentHandle, config.fileIndex)
 }
 
+func loop() {
+	forceShutdown = make(chan bool, 1)
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+	statsTicker := time.Tick(5*time.Second)
+	saveResumeDataTicker := time.Tick(30*time.Second)
+	for {
+		select {
+		case <-forceShutdown:
+			httpListener.Close()
+			return
+		case <-signalChan:
+			forceShutdown <- true
+		case <-time.After(500*time.Millisecond):
+			consumeAlerts()
+			torrentFS.LoadFileProgress()
+			state := torrentHandle.Status().GetState()
+			if config.exitOnFinish && (state == STATE_FINISHED || state == STATE_SEEDING) {
+				forceShutdown <- true
+			}
+			if os.Getppid() == 1 {
+				forceShutdown <- true
+			}
+		case <-statsTicker:
+			stats()
+		case <-saveResumeDataTicker:
+			saveResumeData(true)
+		}
+	}
+}
+
 func main() {
 	// Make sure we are properly multi-threaded, on a minimum of 2 threads
 	// because we lock the main thread for lt.
 	runtime.GOMAXPROCS(runtime.NumCPU())
-
 	parseFlags()
-
-	alerts = bcast.NewGroup()
-	statsTomb = &tomb.Tomb{}
-	alertsTomb = &tomb.Tomb{}
-	logAlertsTomb = &tomb.Tomb{}
-
-	tp := buildTorrentParams(config.uri)
 
 	startSession()
 	startServices()
-	addTorrent(tp)
-
-	go handleSignals()
-	go watchParent()
-	go broadcastAlerts()
-
-	alertsTomb.Go(consumeAlerts)
-	logAlertsTomb.Go(logAlerts)
-	statsTomb.Go(stats)
+	addTorrent(buildTorrentParams(config.uri))
 
 	startHTTP()
+	loop()
+	shutdown()
 }

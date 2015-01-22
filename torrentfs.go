@@ -139,7 +139,9 @@ func (tfs *TorrentFS) Files() []*TorrentFile {
 		file, _ := tfs.FileAt(i)
 		if tfs.progresses != nil && !tfs.progresses.Empty() {
 			file.downloaded = tfs.progresses.Get(i)
-			file.progress = float32(file.downloaded)/float32(file.Size())
+			if file.Size() > 0 {
+				file.progress = float32(file.downloaded)/float32(file.Size())
+			}
 		}
 		files[i] = file
 	}

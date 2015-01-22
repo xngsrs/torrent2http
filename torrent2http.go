@@ -395,7 +395,7 @@ func parseFlags() {
 	flag.StringVar(&config.bindAddress, "bind", "localhost:5001", "Bind address of torrent2http")
 	flag.StringVar(&config.downloadPath, "dl-path", ".", "Download path")
 	flag.IntVar(&config.idleTimeout, "max-idle", -1, "Automatically shutdown if no connection are active after a timeout")
-	flag.IntVar(&config.fileIndex, "file-index", -1, "Download only file with specified index (all files otherwise)")
+	flag.IntVar(&config.fileIndex, "file-index", -1, "Start downloading file with specified index immediately (or start in paused state otherwise)")
 	flag.BoolVar(&config.keepComplete, "keep-complete", false, "Keep complete files after exiting")
 	flag.BoolVar(&config.keepIncomplete, "keep-incomplete", false, "Keep incomplete files after exiting")
 	flag.BoolVar(&config.keepFiles, "keep-files", false, "Keep all files after exiting (incl. -keep-complete and -keep-incomplete)")

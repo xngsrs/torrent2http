@@ -190,6 +190,17 @@ Lists connected peers:
     {"ip":"*.*.*.*","flags":140339,"source":1,"up_speed":0.13964844,"down_speed":1.0400391,"total_upload":0,
     "total_download":9945,"country":"","client":"μTorrent 3.4.2"}]}
 
+### /trackers ###
+
+Lists trackers:
+
+    {"trackers":[{"url":"http://retracker.local/announce","next_announce_in":16,"min_announce_in":6,"error_code":0,
+    "error_message":"","message":"","tier":0,"fail_limit":0,"fails":0,"source":0,
+    "verified":false,"updating":true,"start_sent":false,"complete_sent":false},
+    {"url":"http://********/announce","next_announce_in":16,
+    "min_announce_in":6,"error_code":0, "error_message":"","message":"","tier":0,
+    "fail_limit":0,"fails":0,"source":0,"verified":false,"updating":true,"start_sent":false,"complete_sent":false}]}
+
 ### /shutdown ###
 
 Gracefully shuts down torrent2http. Downloaded files will be removed unless one of `--keep-files`, `--keep-complete-files` or `--keep-incomplete-files` is set

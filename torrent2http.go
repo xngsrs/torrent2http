@@ -20,6 +20,9 @@ import (
 	"time"
 
 	lt "github.com/anteo/libtorrent-go"
+	"github.com/saintfish/chardet"
+	"golang.org/x/net/html/charset"
+	"golang.org/x/text/transform"
 )
 
 type FileStatusInfo struct {
@@ -50,6 +53,27 @@ type PeerInfo struct {
 
 type PeersInfo struct {
 	Peers          []PeerInfo `json:"peers"`
+}
+
+type TrackerInfo struct {
+	Url            string  `json:"url"`
+	NextAnnounceIn int     `json:"next_announce_in"`
+	MinAnnounceIn  int     `json:"min_announce_in"`
+	ErrorCode      int     `json:"error_code"`
+	ErrorMessage   string  `json:"error_message"`
+	Message        string  `json:"message"`
+	Tier           byte    `json:"tier"`
+	FailLimit      byte    `json:"fail_limit"`
+	Fails          byte    `json:"fails"`
+	Source         byte    `json:"source"`
+	Verified       bool    `json:"verified"`
+	Updating       bool    `json:"updating"`
+	StartSent      bool    `json:"start_sent"`
+	CompleteSent   bool    `json:"complete_sent"`
+}
+
+type TrackersInfo struct {
+	Trackers       []TrackerInfo `json:"trackers"`
 }
 
 type SessionStatus struct {
@@ -142,6 +166,24 @@ var stateStrings = map[int]string{
 	STATE_SEEDING: "seeding",
 	STATE_ALLOCATING: "allocating",
 	STATE_CHECKING_RESUME_DATA: "checking_resume_data",
+}
+
+func convertToUtf8(s string) (string) {
+	b := []byte(s)
+	d := chardet.NewTextDetector()
+	r, err := d.DetectBest(b)
+	if err != nil {
+		return fmt.Sprintf("<Can't detect string charset: %s>", err.Error())
+	}
+	encoding, _ := charset.Lookup(r.Charset)
+	if encoding == nil {
+		return fmt.Sprintf("<Can't find encoding: %s>", r.Charset)
+	}
+	str, _, err := transform.String(encoding.NewDecoder(), s)
+	if err != nil {
+		return fmt.Sprintf("<Can't convert string from encoding %s to UTF8: %s>", r.Charset, err.Error())
+	}
+	return str
 }
 
 func statusHandler(w http.ResponseWriter, _ *http.Request) {
@@ -258,6 +300,37 @@ func peersHandler(w http.ResponseWriter, _ *http.Request) {
 			Client:          peer.GetClient(),
 		}
 		ret.Peers = append(ret.Peers, pi)
+	}
+
+	output, _ := json.Marshal(ret)
+	w.Write(output)
+}
+
+func trackersHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	ret := TrackersInfo{}
+
+	vectorAnnounceEntry := torrentHandle.Trackers()
+	for i := 0; i < int(vectorAnnounceEntry.Size()); i++ {
+		entry := vectorAnnounceEntry.Get(i)
+		pi := TrackerInfo{
+			Url:				entry.GetUrl(),
+			NextAnnounceIn:		entry.NextAnnounceIn(),
+			MinAnnounceIn:		entry.MinAnnounceIn(),
+			ErrorCode:			entry.GetLastError().Value(),
+			ErrorMessage:		convertToUtf8(entry.GetLastError().Message()),
+			Message:			convertToUtf8(entry.GetMessage()),
+			Tier:				entry.GetTier(),
+			FailLimit:			entry.GetFailLimit(),
+			Fails:				entry.GetFails(),
+			Source:				entry.GetSource(),
+			Verified:			entry.GetVerified(),
+			Updating:			entry.GetUpdating(),
+			StartSent:			entry.GetStartSent(),
+			CompleteSent:		entry.GetCompleteSent(),
+		}
+		ret.Trackers = append(ret.Trackers, pi)
 	}
 
 	output, _ := json.Marshal(ret)
@@ -490,6 +563,7 @@ func startHTTP() {
 	mux.HandleFunc("/status", statusHandler)
 	mux.HandleFunc("/ls", lsHandler)
 	mux.HandleFunc("/peers", peersHandler)
+	mux.HandleFunc("/trackers", trackersHandler)
 	mux.Handle("/get/", http.StripPrefix("/get/", getHandler(http.FileServer(torrentFS))))
 	mux.HandleFunc("/shutdown", func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintf(w, "OK")
@@ -671,6 +745,7 @@ func startSession() {
 	settings.SetRecvSocketBufferSize(1024 * 1024)
 	settings.SetSendSocketBufferSize(1024 * 1024)
 	settings.SetRateLimitIpOverhead(true)
+	settings.SetMinAnnounceInterval(60)
 	session.SetSettings(settings)
 
 	if config.stateFile != "" {

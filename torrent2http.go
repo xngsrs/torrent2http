@@ -839,9 +839,11 @@ func addTorrent(torrentParams lt.AddTorrentParams) {
 
 	if config.trackers != "" {
 		trackers := strings.Split(config.trackers, ",")
-		for _, tracker := range trackers {
+		startTier := 256-len(trackers)
+		for n, tracker := range trackers {
 			tracker = strings.TrimSpace(tracker)
 			announceEntry := lt.NewAnnounceEntry(tracker)
+			announceEntry.SetTier(byte(startTier + n))
 			log.Printf("Adding tracker: %s", tracker)
 			torrentHandle.AddTracker(announceEntry)
 		}

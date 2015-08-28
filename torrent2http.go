@@ -746,6 +746,7 @@ func startSession() {
 	settings.SetSendSocketBufferSize(1024 * 1024)
 	settings.SetRateLimitIpOverhead(true)
 	settings.SetMinAnnounceInterval(60)
+	settings.SetTrackerBackoff(0)
 	session.SetSettings(settings)
 
 	if config.stateFile != "" {

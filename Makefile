@@ -27,13 +27,14 @@ else ifeq ($(TARGET_ARCH),x64)
 	GOARCH = amd64
 else ifeq ($(TARGET_ARCH),arm)
 	GOARCH = arm
-	GOARM = 6
+	GOARM = 7
 endif
 
+BUILDMODE = default
 ifeq ($(TARGET_OS), windows)
 	EXT = .exe
 	GOOS = windows
-	LDFLAGS := $(LDFLAGS) -extld=$(CC)
+	LDFLAGS := $(LDFLAGS) -linkmode=external -extld=$(CC) '-extldflags=-lstdc++ -static'
 else ifeq ($(TARGET_OS), darwin)
 	EXT =
 	GOOS = darwin
@@ -45,8 +46,8 @@ else ifeq ($(TARGET_OS), linux)
 else ifeq ($(TARGET_OS), android)
 	EXT =
 	GOOS = android
-	GOARM = 7
 	LDFLAGS := $(LDFLAGS) -linkmode=external -extld=$(CC) -extldflags=-lstdc++
+	BUILDMODE = pie
 endif
 
 NAME = torrent2http
@@ -61,24 +62,15 @@ LIBRARY_PATH = $(GOPATH)/pkg/$(GOOS)_$(GOARCH)/$(GO_PACKAGE_NS)
 all: $(PLATFORMS)
 
 $(PLATFORMS):
-	$(DOCKER) run -i --rm -v $(HOME):$(HOME) -v /tmp:/tmp -t -e GOPATH=$(GOPATH) -w $(shell pwd) $(DOCKER_IMAGE):$@ make clean dist;
+	$(DOCKER) run -it --rm -v $(HOME):$(HOME) -v /tmp:/tmp -t -e GOPATH=$(GOPATH) -w $(shell pwd) $(DOCKER_IMAGE):$@ make clean dist;
 
 $(BUILD_PATH):
 	mkdir -p $(BUILD_PATH)
 
 $(BUILD_PATH)/$(OUTPUT_NAME): $(BUILD_PATH)
-	CC=$(CC) GOOS=$(GOOS) GOARCH=$(GOARCH) GOARM=$(GOARM) CGO_ENABLED=$(CGO_ENABLED) $(GO) build -v -x -o $(BUILD_PATH)/$(OUTPUT_NAME) -ldflags="$(LDFLAGS)"
+	CC=$(CC) GOOS=$(GOOS) GOARCH=$(GOARCH) GOARM=$(GOARM) CGO_ENABLED=$(CGO_ENABLED) $(GO) build -v -x -o $(BUILD_PATH)/$(OUTPUT_NAME) -ldflags="$(LDFLAGS)" -buildmode=$(BUILDMODE)
 
-vendor_libs_darwin:
-
-vendor_libs_android:
-
-vendor_libs_linux:
-
-vendor_libs_windows:
-	cp $(LIBRARY_PATH)/*.dll $(BUILD_PATH)
-
-dist: $(BUILD_PATH)/$(OUTPUT_NAME) vendor_libs_$(TARGET_OS)
+dist: $(BUILD_PATH)/$(OUTPUT_NAME)
 
 clean:
 	rm -rf $(BUILD_PATH)

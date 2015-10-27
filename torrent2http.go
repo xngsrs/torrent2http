@@ -134,7 +134,7 @@ type Config struct {
 	trackers                string
 }
 
-const VERSION = "1.0.4"
+const VERSION = "1.0.5"
 const USER_AGENT = "torrent2http/"+VERSION+" libtorrent/"+lt.LIBTORRENT_VERSION
 
 var (

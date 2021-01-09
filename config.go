@@ -47,9 +47,12 @@ type Config struct {
     exitOnFinish			bool
     dhtRouters              string
     trackers                string
+    buffer                  float64
     tunedStorage            bool
     cmdlineProc             string
     downloadStorage         int
+    prioritizePartialPieces bool
+    strictEndGameMode       bool
 }
 
 func (c Config) parseFlags() {
@@ -71,17 +74,17 @@ func (c Config) parseFlags() {
 
     flag.StringVar(&config.resumeFile, "resume-file", "", "Use fast resume file")
     flag.StringVar(&config.stateFile, "state-file", "", "Use file for saving/restoring session state")
-    flag.StringVar(&config.userAgent, "user-agent", USER_AGENT, "Set an user agent")
+    flag.StringVar(&config.userAgent, "user-agent", UserAgent(), "Set an user agent")
     flag.StringVar(&config.dhtRouters, "dht-routers", "", "Additional DHT routers (comma-separated host:port pairs)")
     flag.StringVar(&config.trackers, "trackers", "", "Additional trackers (comma-separated URLs)")
     flag.IntVar(&config.listenPort, "listen-port", 6881, "Use specified port for incoming connections")
     flag.IntVar(&config.torrentConnectBoost, "torrent-connect-boost", 50, "The number of peers to try to connect to immediately when the first tracker response is received for a torrent")
-    flag.IntVar(&config.connectionSpeed, "connection-speed", 50, "The number of peer connection attempts that are made per second")
-    flag.IntVar(&config.peerConnectTimeout, "peer-connect-timeout", 15, "The number of seconds to wait after a connection attempt is initiated to a peer")
-    flag.IntVar(&config.requestTimeout, "request-timeout", 20, "The number of seconds until the current front piece request will time out")
+    flag.IntVar(&config.connectionSpeed, "connection-speed", 250, "The number of peer connection attempts that are made per second")
+    flag.IntVar(&config.peerConnectTimeout, "peer-connect-timeout", 2, "The number of seconds to wait after a connection attempt is initiated to a peer")
+    flag.IntVar(&config.requestTimeout, "request-timeout", 2, "The number of seconds until the current front piece request will time out")
     flag.IntVar(&config.maxDownloadRate, "dl-rate", -1, "Max download rate (kB/s)")
     flag.IntVar(&config.maxUploadRate, "ul-rate", -1, "Max upload rate (kB/s)")
-    flag.IntVar(&config.connectionsLimit, "connections-limit", 200, "Set a global limit on the number of connections opened")
+    flag.IntVar(&config.connectionsLimit, "connections-limit", 50, "Set a global limit on the number of connections opened")
     flag.IntVar(&config.encryption, "encryption", 1, "Encryption: 0=forced 1=enabled (default) 2=disabled")
     flag.IntVar(&config.minReconnectTime, "min-reconnect-time", 60, "The time to wait between peer connection attempts. If the peer fails, the time is multiplied by fail counter")
     flag.IntVar(&config.maxFailCount, "max-failcount", 3, "The maximum times we try to connect to a peer before stop connecting again")
@@ -94,7 +97,10 @@ func (c Config) parseFlags() {
     flag.BoolVar(&config.enableNATPMP, "enable-natpmp", true, "Enable NATPMP (NAT port-mapping)")
     flag.BoolVar(&config.enableUTP, "enable-utp", true, "Enable uTP protocol")
     flag.BoolVar(&config.enableTCP, "enable-tcp", true, "Enable TCP protocol")
+    flag.BoolVar(&config.prioritizePartialPieces, "prioritize-partial-pieces", false, "Prioritize partial pieces vs rare pieces")
+    flag.BoolVar(&config.strictEndGameMode, "strict-end-game-mode", true, "Download same block from multiple peers if one is slow")
     flag.BoolVar(&config.tunedStorage, "tuned-storage", false, "Enable storage optimizations for Android external storage / OS-mounted NAS setups")
+    flag.Float64Var(&config.buffer, "buffer", startBufferPercent, "Buffer percentage from start of file")
     flag.StringVar(&config.cmdlineProc, "cmdline-proc", "", "Display cmdline of specified process")
     flag.IntVar(&config.downloadStorage, "down-storage", 0, "Download storage: 0=file storage 1=ram memory")
     flag.Parse()

@@ -1,43 +1,75 @@
 package main
 
 import (
-    "encoding/json"
+	"encoding/json"
     "encoding/hex"
-    "io/ioutil"
-    "math/rand"
-    "fmt"
-    "log"
-    "net/http"
-    "net/url"
-    "os"
-    "net"
-    "os/signal"
-    "path/filepath"
-    "runtime"
-    "syscall"
-    "strings"
-    "strconv"
-    "time"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"math"
+	"math/rand"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"path"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 
-    lt "github.com/ElementumOrg/libtorrent-go"
-    "github.com/saintfish/chardet"
-    "golang.org/x/net/html/charset"
-    "golang.org/x/text/transform"
+	lt "github.com/ElementumOrg/libtorrent-go"
+)
+
+var dhtBootstrapNodes = []string{
+	"router.bittorrent.com:6881",
+	"router.utorrent.com:6881",
+	"dht.transmissionbt.com:6881",
+	"dht.aelitis.com:6881",     // Vuze
+	"dht.libtorrent.org:25401", // Libtorrent
+}
+
+var defaultTrackers = []string{
+	"http://bt4.t-ru.org/ann?magnet",
+	"http://retracker.mgts.by:80/announce",
+	"http://tracker.city9x.com:2710/announce",
+	"http://tracker.electro-torrent.pl:80/announce",
+	"http://tracker.internetwarriors.net:1337/announce",
+	"http://bt.svao-ix.ru/announce",
+
+	"udp://tracker.opentrackr.org:1337/announce",
+	"udp://tracker.coppersurfer.tk:6969/announce",
+	"udp://tracker.leechers-paradise.org:6969/announce",
+	"udp://tracker.openbittorrent.com:80/announce",
+	"udp://public.popcorn-tracker.org:6969/announce",
+	"udp://explodie.org:6969",
+	"udp://opentor.org:2710",
+}
+
+const (
+	ipToSDefault     = iota
+	ipToSLowDelay    = 1 << iota
+	ipToSReliability = 1 << iota
+	ipToSThroughput  = 1 << iota
+	ipToSLowCost     = 1 << iota
 )
 
 type FileStatusInfo struct {
-    Name        string  `json:"name"`
-    SavePath    string  `json:"save_path"`
-    Url         string  `json:"url"`
-    Size        int64   `json:"size"`
-    Offset      int64   `json:"offset"`
-    Download    int64   `json:"download"`
-    Progress    float32 `json:"progress"`
-    Priority    int  `json:"priority"`
+	Name     string  `json:"name"`
+	SavePath string  `json:"save_path"`
+	URL      string  `json:"url"`
+	Size     int64   `json:"size"`
+	Priority int     `json:"priority"`
+	Download int64   `json:"download"`
+	Progress float32 `json:"progress"`
+	Offset   int64   `json:"offset"`
 }
 
 type LsInfo struct {
-    Files          []FileStatusInfo `json:"files"`
+	Files []FileStatusInfo `json:"files"`
 }
 
 type PeerInfo struct {
@@ -78,54 +110,78 @@ type TrackersInfo struct {
 }
 
 type SessionStatus struct {
-    Name           string   `json:"name"`
-    State          int      `json:"state"`
-    StateStr       string   `json:"state_str"`
-    Error          string   `json:"error"`
-    Progress       float32  `json:"progress"`
-    DownloadRate   float64  `json:"download_rate"`
-    UploadRate     float64  `json:"upload_rate"`
-    TotalDownload  int64    `json:"total_download"`
-    TotalUpload    int64    `json:"total_upload"`
-    NumPeers       int      `json:"num_peers"`
-    NumSeeds       int      `json:"num_seeds"`
-    TotalSeeds     int      `json:"total_seeds"`
-    TotalPeers     int      `json:"total_peers"`
-    HashString     string   `json:"hash_string"`
-    SessionStat    string   `json:"session_status"`
+	Name          string  `json:"name"`
+	State         int     `json:"state"`
+	StateStr      string  `json:"state_str"`
+	Error         string  `json:"error"`
+	Progress      float32 `json:"progress"`
+	DownloadRate  float32 `json:"download_rate"`
+	UploadRate    float32 `json:"upload_rate"`
+	TotalDownload int64   `json:"total_download"`
+	TotalUpload   int64   `json:"total_upload"`
+	NumPeers      int     `json:"num_peers"`
+	NumSeeds      int     `json:"num_seeds"`
+	TotalSeeds    int     `json:"total_seeds"`
+	TotalPeers    int     `json:"total_peers"`
+	HashString    string  `json:"hash_string"`
+	SessionStat   string  `json:"session_status"`
 }
 
-const VERSION = "1.1.14"
-const USER_AGENT = "torrent2http/"+VERSION+" libtorrent/"+lt.LIBTORRENT_VERSION
-
 const (
-    ipToSDefault     = iota
-    ipToSLowDelay    = 1 << iota
-    ipToSReliability = 1 << iota
-    ipToSThroughput  = 1 << iota
-    ipToSlowCost     = 1 << iota
+	startBufferPercent = 0.005
+	endBufferSize      = 10 * 1024 * 1024 // 10m
+	minCandidateSize   = 100 * 1024 * 1024
+	defaultDHTPort     = 6881
 )
+
 var (
-    config Config
-    session lt.SessionHandle
-    sessionglobal lt.Session
-    torrentHandle lt.TorrentHandle
-    torrentFS *TorrentFS
-    forceShutdown chan bool
-    httpListener net.Listener
-    PackSettings  lt.SettingsPack
-    mappedPorts map[string]int
+	config                   Config
+	packSettings             lt.SettingsPack
+	session                  lt.SessionHandle
+	sessionglobal            lt.Session
+	torrentHandle            lt.TorrentHandle
+	torrentInfo              lt.TorrentInfo
+	torrentFS                *TorrentFS
+	forceShutdown            chan bool
+	fileEntryIdx             int
+	bufferPiecesProgressLock sync.RWMutex
+	bufferPiecesProgress     = make(map[int]float64)
+    ms                       lt.MemoryStorage
+	MemorySize               int64
+	mappedPorts              map[string]int
 )
 
 const (
-    STATE_QUEUED_FOR_CHECKING = iota
-    STATE_CHECKING_FILES
-    STATE_DOWNLOADING_METADATA
-    STATE_DOWNLOADING
-    STATE_FINISHED
-    STATE_SEEDING
-    STATE_ALLOCATING
-    STATE_CHECKING_RESUME_DATA
+	STATE_QUEUED_FOR_CHECKING = iota
+	STATE_CHECKING_FILES
+	STATE_DOWNLOADING_METADATA
+	STATE_DOWNLOADING
+	STATE_FINISHED
+	STATE_SEEDING
+	STATE_ALLOCATING
+	STATE_CHECKING_RESUME_DATA
+)
+
+var stateStrings = map[int]string{
+	STATE_QUEUED_FOR_CHECKING:  "queued_for_checking",
+	STATE_CHECKING_FILES:       "checking_files",
+	STATE_DOWNLOADING_METADATA: "downloading_metadata",
+	STATE_DOWNLOADING:          "downloading",
+	STATE_FINISHED:             "finished",
+	STATE_SEEDING:              "seeding",
+	STATE_ALLOCATING:           "allocating",
+	STATE_CHECKING_RESUME_DATA: "checking_resume_data",
+}
+
+const (
+	ERROR_NO_ERROR = iota
+	ERROR_EXPECTED_DIGID
+	ERROR_EXPECTED_COLON
+	ERROR_UNEXPECTED_EOF
+	ERROR_EXPECTED_VALUE
+	ERROR_DEPTH_EXCEEDED
+	ERROR_LIMIT_EXCEEDED
+	ERROR_OVERFLOW
 )
 
 const (
@@ -145,96 +201,52 @@ const (
 	ProxyTypeI2PSAM
 )
 
-var dhtBootstrapNodes = []string{
-	"router.bittorrent.com:6881",
-	"router.utorrent.com:6881",
-	"dht.transmissionbt.com:6881",
-	"dht.aelitis.com:6881",     // Vuze
-	"dht.libtorrent.org:25401", // Libtorrent
+var errorStrings = map[int]string{
+	ERROR_NO_ERROR:       "",
+	ERROR_EXPECTED_DIGID: "expected digit in bencoded string",
+	ERROR_EXPECTED_COLON: "expected colon in bencoded string",
+	ERROR_UNEXPECTED_EOF: "unexpected end of file in bencoded string",
+	ERROR_EXPECTED_VALUE: "expected value (list, dict, int or string) in bencoded string",
+	ERROR_DEPTH_EXCEEDED: "bencoded recursion depth limit exceeded",
+	ERROR_LIMIT_EXCEEDED: "bencoded item count limit exceeded",
+	ERROR_OVERFLOW:       "integer overflow",
 }
 
-// DefaultTrackers ...
-var DefaultTrackers = []string{
-	"http://bt4.t-ru.org/ann?magnet",
-	"http://retracker.mgts.by:80/announce",
-	"http://tracker.city9x.com:2710/announce",
-	"http://tracker.electro-torrent.pl:80/announce",
-	"http://tracker.internetwarriors.net:1337/announce",
-	"http://bt.svao-ix.ru/announce",
-
-	"udp://tracker.opentrackr.org:1337/announce",
-	"udp://tracker.coppersurfer.tk:6969/announce",
-	"udp://tracker.leechers-paradise.org:6969/announce",
-	"udp://tracker.openbittorrent.com:80/announce",
-	"udp://public.popcorn-tracker.org:6969/announce",
-	"udp://explodie.org:6969",
-	"udp://opentor.org:2710",
-}
-
-var stateStrings = map[int]string{
-    STATE_QUEUED_FOR_CHECKING: "queued_for_checking",
-    STATE_CHECKING_FILES: "checking_files",
-    STATE_DOWNLOADING_METADATA: "downloading_metadata",
-    STATE_DOWNLOADING: "downloading",
-    STATE_FINISHED: "finished",
-    STATE_SEEDING: "seeding",
-    STATE_ALLOCATING: "allocating",
-    STATE_CHECKING_RESUME_DATA: "checking_resume_data",
-}
-
-func convertToUtf8(s string) (string) {
-    b := []byte(s)
-    d := chardet.NewTextDetector()
-    r, err := d.DetectBest(b)
-    if err != nil {
-        return fmt.Sprintf("<Can't detect string charset: %s>", err.Error())
-    }
-    encoding, _ := charset.Lookup(r.Charset)
-    if encoding == nil {
-        return fmt.Sprintf("<Can't find encoding: %s>", r.Charset)
-    }
-    str, _, err := transform.String(encoding.NewDecoder(), s)
-    if err != nil {
-        return fmt.Sprintf("<Can't convert string from encoding %s to UTF8: %s>", r.Charset, err.Error())
-    }
-    return str
-}
-
+var forceshutdelete = false
 func statusHandler(w http.ResponseWriter, _ *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/json")
 
-    var status SessionStatus
-    var statsesion string
-    
-    if torrentHandle == nil {
-        status = SessionStatus{State: -1}
-    } else {
-        tstatus := torrentHandle.Status()
+	var status SessionStatus
+	var statsesion string
+	if torrentHandle == nil {
+		status = SessionStatus{State: -1}
+	} else {
+		tstatus := torrentHandle.Status()
         if session.IsPaused() {
             statsesion = "paused"
         } else {
             statsesion = "running"
         }
-        status = SessionStatus{
-            Name:          tstatus.GetName(),
-            State:         int(tstatus.GetState()),
-            StateStr:	   stateStrings[int(tstatus.GetState())],
-            Error:         tstatus.GetError(),
-            Progress:      tstatus.GetProgress(),
-            TotalDownload: tstatus.GetTotalDownload(),
-            TotalUpload:   tstatus.GetTotalUpload(),
-            DownloadRate:  float64(tstatus.GetDownloadPayloadRate()) / 1024,
-            UploadRate:    float64(tstatus.GetUploadPayloadRate()) / 1024,
-            NumPeers:      tstatus.GetNumPeers(),
-            TotalPeers:    tstatus.GetListPeers(),
-            NumSeeds:      tstatus.GetNumSeeds(),
-            TotalSeeds:    tstatus.GetListSeeds(),
+		status = SessionStatus{
+			Name:          tstatus.GetName(),
+			State:         int(tstatus.GetState()),
+			StateStr:      stateStrings[int(tstatus.GetState())],
+			Error:         errorStrings[tstatus.GetErrc().Value()],
+			Progress:      tstatus.GetProgress(),
+			TotalDownload: tstatus.GetTotalDownload(),
+			TotalUpload:   tstatus.GetTotalUpload(),
+			DownloadRate:  float32(tstatus.GetDownloadPayloadRate()) / 1024,
+			UploadRate:    float32(tstatus.GetUploadPayloadRate()) / 1024,
+			NumPeers:      tstatus.GetNumPeers(),
+			TotalPeers:    tstatus.GetNumIncomplete(),
+			NumSeeds:      tstatus.GetNumSeeds(),
+			TotalSeeds:    tstatus.GetNumComplete(),
             HashString:    hex.EncodeToString([]byte(tstatus.GetInfoHash().ToString())),
             SessionStat:   statsesion}
-    }
+	}
 
-    output, _ := json.Marshal(status)
-    w.Write(output)
+	output, _ := json.Marshal(status)
+	w.Write(output)
 }
 
 func stats() {
@@ -243,16 +255,7 @@ func stats() {
         return
     }
     if config.showAllStats || config.showOverallProgress {
-        sessionStatus := session.Status()
-        dhtStatusStr := ""
-        if session.IsDhtRunning() {
-            dhtStatusStr = fmt.Sprintf(", DHT nodes: %d", sessionStatus.GetDhtNodes())
-        }
-        errorStr := ""
-        if len(status.GetError()) > 0 {
-            errorStr = fmt.Sprintf(" (%s)", status.GetError())
-        }
-        log.Printf("%s, overall progress: %.2f%%, dl/ul: %.3f/%.3f kbps, peers/seeds: %d/%d" + dhtStatusStr + errorStr,
+        log.Printf("%s, overall progress: %.2f%%, dl/ul: %.3f/%.3f kbps, peers/seeds: %d/%d",
             strings.Title(stateStrings[int(status.GetState())]),
                 status.GetProgress()*100,
                 float32(status.GetDownloadRate())/1024,
@@ -263,51 +266,94 @@ func stats() {
     }
     if config.showFilesProgress || config.showAllStats {
         str := "Files: "
-        for i, f := range torrentFS.Files() {
-            str += fmt.Sprintf("[%d] %.2f%% ", i, f.Progress()*100)
+        numFiles := torrentInfo.NumFiles()
+        files := torrentInfo.Files()
+        progresses := lt.NewStdVectorSizeType()
+        defer lt.DeleteStdVectorSizeType(progresses)
+        torrentHandle.FileProgress(progresses, int(lt.WrappedTorrentHandlePieceGranularity))
+        for i := 0; i < numFiles; i++ {
+            download := progresses.Get(i)
+            progress := float32(download)/float32(files.FileSize(i))
+            str += fmt.Sprintf("[%d] %.2f%% ", i, progress*100)
         }
         log.Println(str)
     }
-    if (config.showPiecesProgress || config.showAllStats) && torrentFS.LastOpenedFile() != nil {
-        torrentFS.LastOpenedFile().ShowPieces()
+    if (config.showPiecesProgress || config.showAllStats) && torrentInfo != nil {
+        for _, r := range torrentFS.readers {
+            if r.IsActive() {
+                r.ShowPieces()
+            }
+        }
     }
 }
 
-func lsHandler(w http.ResponseWriter, _ *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-
-    retFiles := LsInfo{}
-    
-    if torrentFS.HasTorrentInfo() {
-        for index, file := range torrentFS.Files() {
-            prio := 0
-            for indexf, priority := range torrentFS.priorities {
-                if indexf == index {
-                    prio = priority
-                    break
-                }
-            }
-            url := url.URL{
-                Scheme:    "http",
-                Host:      config.bindAddress,
-                Path:      "/files/" + file.Name(),
-            }
-            fi := FileStatusInfo{
-                Name:      file.Name(),
-                Size:      file.Size(),
-                Offset:    file.Offset(),
-                Download:  file.Downloaded(),
-                Progress:  file.Progress(),
-                SavePath:  file.SavePath(),
-                Url:       url.String(),
-                Priority:  prio,
-            }
-            retFiles.Files = append(retFiles.Files, fi)
+func getHandler(h http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        index, err := strconv.Atoi(r.URL.String())
+        if err == nil && torrentInfo != nil {
+               for i := 0; i < torrentInfo.NumFiles(); i++ {
+                   if i == index {
+                    torrentHandle.FilePriority(i, 1)
+                   } else {
+                       torrentHandle.FilePriority(i, 0)
+                   }
+               }
+//                config.fileIndex = index
+//                onMetadataReceived()
+//             file := torrentInfo.Files().FilePath(index)
+//             if file != "" {
+//                 r.URL.Path = file
+//                 h.ServeHTTP(w, r)
+//                 return
+//             }
         }
-    }
+        http.NotFound(w, r)
+    })
+}
 
-    output, _ := json.Marshal(retFiles)
-    w.Write(output)
+func lsHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	retFiles := LsInfo{}
+
+	if torrentHandle.IsValid() && torrentInfo != nil {
+		if fileEntryIdx >= 0 && fileEntryIdx < torrentInfo.NumFiles() {
+            numFiles := torrentInfo.NumFiles()
+            filePriorities := torrentHandle.FilePriorities()
+            progresses := lt.NewStdVectorSizeType()
+            defer lt.DeleteStdVectorSizeType(progresses)
+            torrentHandle.FileProgress(progresses, int(lt.WrappedTorrentHandlePieceGranularity))
+            files := torrentInfo.Files()
+            for i := 0; i < numFiles; i++ {
+                prio := filePriorities.Get(i)
+                download := progresses.Get(i)
+                progress := float32(download)/float32(files.FileSize(i))
+                offset := files.FileOffset(i)
+                path, _ := filepath.Abs(path.Join(config.downloadPath, files.FilePath(i)))
+
+                url := url.URL{
+                    Host:   config.bindAddress,
+                    Path:   "/files/" + files.FilePath(i),
+                    Scheme: "http",
+                }
+                fsi := FileStatusInfo{
+                    Name:     files.FilePath(i),
+                    Size:     files.FileSize(i),
+                    Offset:   offset,
+                    Download: download,
+                    Progress: progress,
+                    SavePath: path,
+                    URL:      url.String(),
+                    Priority: prio,
+                }
+                retFiles.Files = append(retFiles.Files, fsi)
+            }
+            defer lt.DeleteStdVectorInt(filePriorities)
+		}
+	}
+
+	output, _ := json.Marshal(retFiles)
+	w.Write(output)
 }
 
 func peersHandler(w http.ResponseWriter, _ *http.Request) {
@@ -327,7 +373,8 @@ func peersHandler(w http.ResponseWriter, _ *http.Request) {
             DownSpeed:       float32(peer.GetDownSpeed())/1024,
             TotalDownload:   peer.GetTotalDownload(),
             TotalUpload:     peer.GetTotalUpload(),
-            Country:         peer.GetCountry(),
+            //Country:         peer.GetCountry(),
+            Country:         "",
             Client:          peer.GetClient(),
         }
         ret.Peers = append(ret.Peers, pi)
@@ -350,8 +397,8 @@ func trackersHandler(w http.ResponseWriter, _ *http.Request) {
             NextAnnounceIn:		entry.NextAnnounceIn(),
             MinAnnounceIn:		entry.MinAnnounceIn(),
             ErrorCode:			entry.GetLastError().Value(),
-            ErrorMessage:		convertToUtf8(entry.GetLastError().Message().(string)),
-            Message:			convertToUtf8(entry.GetMessage()),
+            ErrorMessage:		entry.GetLastError().Message().(string),
+            Message:			entry.GetMessage(),
             Tier:				entry.GetTier(),
             FailLimit:			entry.GetFailLimit(),
             Fails:				entry.GetFails(),
@@ -368,186 +415,19 @@ func trackersHandler(w http.ResponseWriter, _ *http.Request) {
     w.Write(output)
 }
 
-func filesToRemove() []string {
-    var files []string
-    if torrentFS.HasTorrentInfo() {
-        for _, file := range torrentFS.Files() {
-            if (!config.keepComplete || !file.IsComplete()) && (!config.keepIncomplete || file.IsComplete()) {
-                if _, err := os.Stat(file.SavePath()); !os.IsNotExist(err) {
-                    files = append(files, file.SavePath())
-                }
-            }
-        }
-    }
-    return files
-}
-
-func trimPathSeparator(path string) string {
-    last := len(path)-1
-    if last > 0 && os.IsPathSeparator(path[last]) {
-        path = path[:last]
-    }
-    return path
-}
-
-func removeFiles(files [] string) {
-    for _, file := range files {
-        if err := os.Remove(file); err != nil {
-            log.Println(err)
-        } else {
-            // Remove empty folders as well
-            path := filepath.Dir(file)
-            savePath, _ := filepath.Abs(config.downloadPath)
-            savePath = trimPathSeparator(savePath)
-            for path != savePath {
-                os.Remove(path)
-                path = trimPathSeparator(filepath.Dir(path))
-            }
-            log.Println("files removed...")
-        }
-    }
-}
-
-func waitForAlert(name string, timeout time.Duration) lt.Alert {
-    start := time.Now()
-    for {
-        for {
-            alert := session.WaitForAlert(lt.Milliseconds(100))
-            if time.Now().Sub(start) > timeout {
-                return nil
-            }
-            if alert.Swigcptr() != 0 {
-                alert = popAlert(false)
-                //log.Printf("waiting for alert (%s) %s", alert.What(), alert.Message())
-                if alert.What() == name {
-                    return alert
-                }
-            }
-        }
-    }
-}
-
-func removeTorrent() {
-    var flag int
-    var files []string
-
-    state := torrentHandle.Status().GetState()
-    if state != STATE_CHECKING_FILES && state != STATE_QUEUED_FOR_CHECKING && !config.keepFiles {
-        if !config.keepComplete && !config.keepIncomplete {
-            flag = int(lt.SessionHandleDeleteFiles)
-        } else {
-            files = filesToRemove()
-        }
-    }
-    log.Println("Removing the torrent")
-    session.RemoveTorrent(torrentHandle, flag)
-    if flag != 0 || len(files) > 0 {
-        log.Println("Waiting for files to be removed")
-        waitForAlert("torrent_removed_alert", 15*time.Second)
-        removeFiles(files)
-    }
-}
-
-func saveResumeData(async bool) bool {
-    if !torrentHandle.Status().GetNeedSaveResume() || config.resumeFile == "" {
-        return false
-    }
-    torrentHandle.SaveResumeData(3)
-    if !async {
-        alert := waitForAlert("save_resume_data_alert", 5*time.Second)
-        if alert == nil {
-            return false
-        }
-        processSaveResumeDataAlert(alert)
-    }
-    return true
-}
-
-func saveSessionState() {
-    if config.stateFile == "" {
-        return
-    }
-    entry := lt.NewEntry()
-    session.SaveState(entry)
-    data := lt.Bencode(entry)
-    log.Printf("Saving session state to: %s", config.stateFile)
-    err := ioutil.WriteFile(config.stateFile, []byte(data), 0644)
-    if err != nil {
-        log.Println(err)
-    }
-}
-
-func shutdown() {
-    log.Println("Stopping torrent2http...")
-    if session != nil {
-        if !session.IsPaused() {
-            session.Pause()
-            waitForAlert("torrent_paused_alert", 10*time.Second)
-        }
-        if torrentHandle != nil {
-            saveResumeData(false)
-            saveSessionState()
-            removeTorrent()
-        }
-        log.Println("Aborting the session")
-        lt.DeleteSession(sessionglobal)
-    }
-    log.Println("Bye bye")
-}
-
-func NewConnectionCounterHandler(connTrackChannel chan int, handler http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        connTrackChannel <- 1
-        handler.ServeHTTP(w, r)
-        connTrackChannel <- -1
-    })
-}
-
-func inactiveAutoShutdown(connTrackChannel chan int) {
-    activeConnections := 0
-
-    for {
-        if activeConnections == 0 {
-            select {
-            case inc := <-connTrackChannel:
-                activeConnections += inc
-            case <-time.After(time.Duration(config.idleTimeout) * time.Second):
-                forceShutdown <- true
-            }
-        } else {
-            activeConnections += <-connTrackChannel
-        }
-    }
-}
-
-func getHandler(h http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        index, err := strconv.Atoi(r.URL.String())
-        if err == nil && torrentFS.HasTorrentInfo() {
-            file, err := torrentFS.FileAt(index)
-            if err == nil {
-                r.URL.Path = file.Name()
-                h.ServeHTTP(w, r)
-                return
-            }
-        }
-        http.NotFound(w, r)
-    })
-}
-
 func prioHandler(w http.ResponseWriter, r *http.Request) {
     
-    var name string
-    
     query := r.URL.Query()
+    ret := ""
     index, err := strconv.Atoi(query.Get("index"))
     priority, err := strconv.Atoi(query.Get("priority"))
-    torrentFS.setPriority(index, priority)
-    file, err := torrentFS.FileAt(index)
     if err == nil {
-        name = file.Name()
+        files := torrentInfo.Files()
+        fileEntryIdx = index
+        torrentHandle.FilePriority(index, priority)
+        ret = "File named: " + files.FilePath(index) + " is set with priority " + strconv.Itoa(priority)
+        prioritizepieces()
     }
-    ret := "File named: " + name + " is set with priority " + strconv.Itoa(priority)
     
     w.WriteHeader(200)
     w.Write([]byte(ret))
@@ -555,7 +435,7 @@ func prioHandler(w http.ResponseWriter, r *http.Request) {
 
 func comandHandler(w http.ResponseWriter, r *http.Request) {
     
-    settings := PackSettings
+    settings := packSettings
     query := r.URL.Query()
     ret := ""
     confcom, ok := query["command"]
@@ -590,255 +470,374 @@ func comandHandler(w http.ResponseWriter, r *http.Request) {
     w.Write([]byte(ret))
 }
 
-func stopanddelete() {
-    log.Println("Stopping torrent2http...")
-    if session != nil {
-        if !session.IsPaused() {
-            session.Pause()
-        }
-        if torrentHandle != nil {
-            forceremoveTorrent()
-        }
-    }
-    log.Println("Bye bye")
+func filesToRemove() []string {
+	var filesToRemove []string
+	if torrentInfo != nil {
+		progresses := lt.NewStdVectorSizeType()
+		defer lt.DeleteStdVectorSizeType(progresses)
+        
+        torrentHandle.FileProgress(progresses, int(lt.WrappedTorrentHandlePieceGranularity))
+		numFiles := torrentInfo.NumFiles()
+		for i := 0; i < numFiles; i++ {
+			files := torrentInfo.Files()
+			downloaded := progresses.Get(i)
+			size := files.FileSize(i)
+			completed := downloaded == size
+
+			if ((!config.keepComplete || !completed) && (!config.keepIncomplete || completed)) || forceshutdelete {
+				savePath, _ := filepath.Abs(path.Join(config.downloadPath, files.FilePath(i)))
+				if _, err := os.Stat(savePath); !os.IsNotExist(err) {
+					filesToRemove = append(filesToRemove, savePath)
+				}
+			}
+		}
+	}
+	return filesToRemove
 }
 
-func forceremoveTorrent() {
-    var flag int
-    var files []string
-    flag = int(lt.SessionHandleDeleteFiles)
-    files = forcefilesToRemove()
-    log.Println("Removing the torrent")
-    session.RemoveTorrent(torrentHandle, flag)
-    if flag != 0 || len(files) > 0 {
-        log.Println("Waiting for files to be removed")
-        removeFiles(files)
-    }
+func trimPathSeparator(path string) string {
+	last := len(path) - 1
+	if last > 0 && os.IsPathSeparator(path[last]) {
+		path = path[:last]
+	}
+	return path
 }
 
-func forcefilesToRemove() []string {
-    var files []string
-    if torrentFS.HasTorrentInfo() {
-        for _, file := range torrentFS.Files() {
-            if _, err := os.Stat(file.SavePath()); !os.IsNotExist(err) {
-                files = append(files, file.SavePath())
-            }
-        }
+func removeFiles(files []string) {
+	for _, file := range files {
+		if err := os.Remove(file); err != nil {
+			log.Println(err)
+		} else {
+			// Remove empty folders as well
+			path := filepath.Dir(file)
+			savePath, _ := filepath.Abs(config.downloadPath)
+			savePath = trimPathSeparator(savePath)
+			for path != savePath {
+				os.Remove(path)
+				path = trimPathSeparator(filepath.Dir(path))
+			}
+		}
+	}
+}
+
+func waitForAlert(name string, timeout time.Duration) lt.Alert {
+	start := time.Now()
+	var retAlert lt.Alert
+	for retAlert == nil {
+		for retAlert == nil {
+			alert := session.WaitForAlert(lt.Milliseconds(100))
+			if time.Now().Sub(start) > timeout {
+				return nil
+			}
+			if alert.Swigcptr() != 0 {
+				var alerts lt.StdVectorAlerts
+				alerts = session.PopAlerts()
+				queueSize := alerts.Size()
+				for i := 0; i < int(queueSize); i++ {
+					alert := alerts.Get(i)
+                    //log.Printf("alert debug info: %s", alert.What())
+					if alert.What() == name {
+						retAlert = alert
+					}
+					processAlert(alert)
+				}
+			}
+		}
+	}
+	return retAlert
+}
+
+func removeTorrent() {
+	var flag int
+	var files []string
+
+	state := torrentHandle.Status().GetState()
+	if state != STATE_CHECKING_FILES && state != STATE_QUEUED_FOR_CHECKING && !config.keepFiles {
+		if (!config.keepComplete && !config.keepIncomplete) || forceshutdelete {
+			flag = int(lt.WrappedSessionHandleDeleteFiles)
+		} else {
+			files = filesToRemove()
+		}
+	}
+	log.Println("removing the torrent")
+	session.RemoveTorrent(torrentHandle, flag)
+	if flag != 0 || len(files) > 0 {
+		log.Println("waiting for files to be removed")
+		waitForAlert("torrent_deleted_alert", 15*time.Second)
+		removeFiles(files)
+	}
+}
+
+func saveResumeData(async bool) bool {
+    if forceshutdelete {
+        return false
     }
-    return files
+	if !torrentHandle.Status().GetNeedSaveResume() || config.resumeFile == "" {
+		return false
+	}
+	torrentHandle.SaveResumeData(3)
+	if !async {
+		alert := waitForAlert("save_resume_data_alert", 5*time.Second)
+		if alert == nil {
+			return false
+		}
+		processSaveResumeDataAlert(alert)
+	}
+	return true
+}
+
+func saveSessionState() {
+	if config.stateFile == "" {
+		return
+	}
+	entry := lt.NewEntry()
+	session.SaveState(entry)
+	data := lt.Bencode(entry)
+	log.Printf("saving session state to: %s", config.stateFile)
+	err := ioutil.WriteFile(config.stateFile, []byte(data), 0644)
+	if err != nil {
+		log.Println(err)
+	}
+}
+
+func shutdown() {
+	log.Println("stopping torrent2http...")
+	if session != nil {
+		session.Pause()
+		waitForAlert("torrent_paused_alert", 10*time.Second)
+		if torrentHandle != nil {
+			saveResumeData(false)
+			saveSessionState()
+			removeTorrent()
+		}
+		log.Println("aborting the session")
+		lt.DeleteSession(sessionglobal)
+	}
+	log.Println("bye bye")
+	os.Exit(0)
+}
+
+func connectionCounterHandler(connTrackChannel chan int, handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connTrackChannel <- 1
+		handler.ServeHTTP(w, r)
+		connTrackChannel <- -1
+	})
+}
+
+func inactiveAutoShutdown(connTrackChannel chan int) {
+	activeConnections := 0
+	for {
+		if activeConnections == 0 {
+			select {
+			case inc := <-connTrackChannel:
+				activeConnections += inc
+			case <-time.After(time.Duration(config.idleTimeout) * time.Second):
+				forceShutdown <- true
+			}
+		} else {
+			activeConnections += <-connTrackChannel
+		}
+	}
 }
 
 func startHTTP() {
-    log.Println("Starting HTTP Server...")
+	log.Println("starting HTTP Server...")
 
-    mux := http.NewServeMux()
-    mux.HandleFunc("/status", statusHandler)
-    mux.HandleFunc("/ls", lsHandler)
-    mux.HandleFunc("/peers", peersHandler)
-    mux.HandleFunc("/trackers", trackersHandler)
-    mux.HandleFunc("/command", comandHandler)
-    mux.Handle("/get/", http.StripPrefix("/get/", getHandler(http.FileServer(torrentFS))))
-    mux.HandleFunc("/priority", prioHandler)
-    mux.HandleFunc("/stopanddelete", func(w http.ResponseWriter, _ *http.Request) {
+	http.HandleFunc("/status", statusHandler)
+	http.HandleFunc("/ls", lsHandler)
+    http.HandleFunc("/peers", peersHandler)
+    http.HandleFunc("/trackers", trackersHandler)
+    http.HandleFunc("/command", comandHandler)
+    http.Handle("/get/", http.StripPrefix("/get/", getHandler(http.FileServer(torrentFS))))
+    http.HandleFunc("/priority", prioHandler)
+    http.HandleFunc("/stopanddelete", func(w http.ResponseWriter, _ *http.Request) {
         fmt.Fprintf(w, "torrent stopped and files deleted")
-        stopanddelete()
-        forceShutdown <- true
-        torrentFS.Shutdown()
-        lt.DeleteSession(sessionglobal)
-        os.Exit(0)
-    })
-    mux.HandleFunc("/shutdown", func(w http.ResponseWriter, _ *http.Request) {
-        fmt.Fprintf(w, "OK")
+        forceshutdelete = true
         forceShutdown <- true
     })
-    mux.HandleFunc("/stop", func(w http.ResponseWriter, _ *http.Request) {
+	http.HandleFunc("/shutdown", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, "OK")
+		forceShutdown <- true
+	})
+    http.HandleFunc("/stop", func(w http.ResponseWriter, _ *http.Request) {
         fmt.Fprintf(w, "Torrent Stopped")
         session.Pause()
     })
-    mux.HandleFunc("/pausetorrent", func(w http.ResponseWriter, _ *http.Request) {
+    http.HandleFunc("/pausetorrent", func(w http.ResponseWriter, _ *http.Request) {
         fmt.Fprintf(w, "Torrent Paused")
         torrentHandle.AutoManaged(false)
         torrentHandle.Pause(0)
         torrentHandle.Pause()
     })
-    mux.HandleFunc("/resumetorrent", func(w http.ResponseWriter, _ *http.Request) {
+    http.HandleFunc("/resumetorrent", func(w http.ResponseWriter, _ *http.Request) {
         fmt.Fprintf(w, "Torrent Resumed")
         torrentHandle.AutoManaged(true)
         torrentHandle.Resume()
     })
-    mux.HandleFunc("/resume", func(w http.ResponseWriter, _ *http.Request) {
+    http.HandleFunc("/resume", func(w http.ResponseWriter, _ *http.Request) {
         fmt.Fprintf(w, "Torrent Started")
         session.Resume()
     })
-    mux.Handle("/files/", http.StripPrefix("/files/", http.FileServer(torrentFS)))
+	http.Handle("/files/", http.StripPrefix("/files/", http.FileServer(torrentFS)))
 
-    handler := http.Handler(mux)
-    if config.idleTimeout > 0 {
-        connTrackChannel := make(chan int, 10)
-        handler = NewConnectionCounterHandler(connTrackChannel, mux)
-        go inactiveAutoShutdown(connTrackChannel)
-    }
+	handler := http.Handler(http.DefaultServeMux)
+	if config.idleTimeout > 0 {
+		connTrackChannel := make(chan int, 10)
+		handler = connectionCounterHandler(connTrackChannel, handler)
+		go inactiveAutoShutdown(connTrackChannel)
+	}
 
-    log.Printf("Listening HTTP on %s...\n", config.bindAddress)
-    s := &http.Server{
-        Addr: config.bindAddress,
-        Handler: handler,
-    }
-
-    var e error
-    if httpListener, e = net.Listen("tcp", config.bindAddress); e != nil {
-        log.Fatal(e)
-    }
-    go s.Serve(httpListener)
+	log.Printf("listening HTTP on %s\n", config.bindAddress)
+	if err := http.ListenAndServe(config.bindAddress, handler); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func popAlert(logAlert bool) lt.Alert {
-    
-    alerts := session.PopAlerts()
-    queueSize := alerts.Size()
-    if int(queueSize) > 0 {
-        for i := 0; i < int(queueSize); i++ {
-            ltAlert := alerts.Get(i)
-            alertPtr := ltAlert.Swigcptr()
-            alertMessage := ltAlert.Message()
-            alertWhat := ltAlert.What()
-            if alertPtr == 0 {
-                return nil
-            }
-            if logAlert {
-                str := ""
-                switch alertWhat {
-                case "tracker_error_alert":
-                    str = lt.SwigcptrTrackerErrorAlert(alertPtr).GetMsg()
-                    break
-                case "tracker_warning_alert":
-                    str = lt.SwigcptrTrackerWarningAlert(alertPtr).GetMsg()
-                    break
-                case "scrape_failed_alert":
-                    str = lt.SwigcptrScrapeFailedAlert(alertPtr).GetMsg()
-                    break
-                case "url_seed_alert":
-                    str = lt.SwigcptrUrlSeedAlert(alertPtr).GetMsg()
-                    break
-                }
-                if str != "" {
-                    log.Printf("(%s) %s: %s", alertWhat, alertMessage, str)
-                } else {
-                    log.Printf("(%s) %s", alertWhat, alertMessage)
-                }
-            }
-        }
-        return alerts.Get(0)
-    } else {
-        return nil
-    }
+func logAlert(alert lt.Alert) {
+	str := ""
+	switch alert.What() {
+	case "tracker_error_alert":
+		str = lt.SwigcptrTrackerErrorAlert(alert.Swigcptr()).ErrorMessage()
+		break
+	case "tracker_warning_alert":
+		str = lt.SwigcptrTrackerWarningAlert(alert.Swigcptr()).WarningMessage()
+		break
+	case "scrape_failed_alert":
+		str = lt.SwigcptrScrapeFailedAlert(alert.Swigcptr()).ErrorMessage()
+		break
+	case "url_seed_alert":
+		str = lt.SwigcptrUrlSeedAlert(alert.Swigcptr()).ErrorMessage()
+		break
+	}
+	if str != "" {
+		log.Printf("(%s) %s: %s", alert.What(), alert.Message(), str)
+	} else {
+		log.Printf("(%s) %s", alert.What(), alert.Message())
+	}
 }
 
 func processSaveResumeDataAlert(alert lt.Alert) {
-    saveResumeDataAlert := lt.SwigcptrSaveResumeDataAlert(alert.Swigcptr())
-    log.Printf("Saving resume data to: %s", config.resumeFile)
-    data := lt.Bencode(saveResumeDataAlert.ResumeData())
-    err := ioutil.WriteFile(config.resumeFile, []byte(data), 0644)
-    if err != nil {
-        log.Println(err)
-    }
+	saveResumeDataAlert := lt.SwigcptrSaveResumeDataAlert(alert.Swigcptr())
+	log.Printf("saving resume data to: %s", config.resumeFile)
+	data := lt.Bencode(saveResumeDataAlert.ResumeData())
+	err := ioutil.WriteFile(config.resumeFile, []byte(data), 0644)
+	if err != nil {
+		log.Println(err)
+	}
+}
+
+func processAlert(alert lt.Alert) {
+	switch alert.What() {
+	case "save_resume_data_alert":
+		processSaveResumeDataAlert(alert)
+		break
+	case "metadata_received_alert":
+		onMetadataReceived()
+		break
+	}
 }
 
 func consumeAlerts() {
-    for {
-        var alert lt.Alert
-        if alert = popAlert(true); alert == nil {
-            break
-        }
-        if alert.What() == "save_resume_data_alert" {
-            processSaveResumeDataAlert(alert)
-        }
-    }
+	var alerts lt.StdVectorAlerts
+	alerts = session.PopAlerts()
+	queueSize := alerts.Size()
+	for i := 0; i < int(queueSize); i++ {
+		alert := alerts.Get(i)
+		logAlert(alert)
+		processAlert(alert)
+	}
 }
 
 func buildTorrentParams(uri string) lt.AddTorrentParams {
-    fileUri, err := url.Parse(uri)
-    torrentParams := lt.NewAddTorrentParams()
-    //defer lt.DeleteAddTorrentParams(torrentParams)
-    
-    error := lt.NewErrorCode()
-    if err != nil {
-        log.Fatal(err)
-    }
-    if fileUri.Scheme == "file" {
-        uriPath := fileUri.Path
-        if uriPath != "" && runtime.GOOS == "windows" && os.IsPathSeparator(uriPath[0]) {
-            uriPath = uriPath[1:]
-        }
-        absPath, err := filepath.Abs(uriPath)
-        if err != nil {
-            log.Fatalf(err.Error())
-        }
-        log.Printf("Opening local file: %s", absPath)
-        if _, err := os.Stat(absPath); err != nil {
-            log.Fatalf(err.Error())
-        }
-        torrentInfo := lt.NewTorrentInfo(absPath, error)
-        if error.Value() != 0 {
-            log.Fatalln(error.Message())
-        }
-        torrentParams.SetTorrentInfo(torrentInfo)
-    } else {
-        log.Printf("Will fetch: %s", uri)
-        torrentParams.SetUrl(uri)
-    }
+	fileUri, err := url.Parse(uri)
+	torrentParams := lt.NewAddTorrentParams()
+	error := lt.NewErrorCode()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if fileUri.Scheme == "file" {
+		uriPath := fileUri.Path
+		if uriPath != "" && runtime.GOOS == "windows" && os.IsPathSeparator(uriPath[0]) {
+			uriPath = uriPath[1:]
+		}
+		absPath, err := filepath.Abs(uriPath)
+		if err != nil {
+			log.Fatalf(err.Error())
+		}
+		log.Printf("opening local file: %s", absPath)
+		if _, err := os.Stat(absPath); err != nil {
+			log.Fatalf(err.Error())
+		}
+		torrentInfo := lt.NewTorrentInfo(absPath, error)
+		if error.Value() != 0 {
+			log.Fatalln(error.Message())
+		}
+		torrentParams.SetTorrentInfo(torrentInfo)
+	} else {
+		log.Printf("will fetch: %s", uri)
+		torrentParams.SetUrl(uri)
+	}
 
-    log.Printf("Setting save path: %s", config.downloadPath)
-    torrentParams.SetSavePath(config.downloadPath)
+	log.Printf("setting save path: %s", config.downloadPath)
+	torrentParams.SetSavePath(config.downloadPath)
 
-    if _, err := os.Stat(config.resumeFile); !os.IsNotExist(err) {
-        log.Printf("loading resume file: %s", config.resumeFile)
-        bytes, err := ioutil.ReadFile(config.resumeFile)
-        if err != nil {
-            log.Println(err)
-        } else {
-            resumeData := lt.NewStdVectorChar()
-            defer lt.DeleteStdVectorChar(resumeData)
-            for _, byte := range bytes {
-                resumeData.Add(byte)
-            }
-            torrentParams.SetResumeData(resumeData)
-        }
-    }
+	if _, err := os.Stat(config.resumeFile); !os.IsNotExist(err) {
+		log.Printf("loading resume file: %s", config.resumeFile)
+		bytes, err := ioutil.ReadFile(config.resumeFile)
+		if err != nil {
+			log.Println(err)
+		} else {
+			resumeData := lt.NewStdVectorChar()
+			defer lt.DeleteStdVectorChar(resumeData)
+			for _, byte := range bytes {
+				resumeData.Add(byte)
+			}
+			torrentParams.SetResumeData(resumeData)
+		}
+	}
 
-    if config.noSparseFile {
-        log.Println("Disabling sparse file support...")
-        torrentParams.SetStorageMode(lt.StorageModeAllocate)
-    }
+	if config.noSparseFile {
+		log.Println("disabling sparse file support...")
+		torrentParams.SetStorageMode(lt.StorageModeAllocate)
+	}
 
-    return torrentParams
+	return torrentParams
 }
 
 func startServices() {
-    if config.enableDHT {
-        log.Println("Starting DHT...")
-        PackSettings.SetStr("dht_bootstrap_nodes", strings.Join(dhtBootstrapNodes, ","))
-		PackSettings.SetBool("enable_dht", true)
-    }
-    if config.enableLSD {
-        log.Println("Starting LSD...")
-        PackSettings.SetBool("enable_lsd", true)
-    }
-    if config.enableUPNP {
-        log.Println("Starting UPNP...")
-        PackSettings.SetBool("enable_upnp", true)
-    }
-    if config.enableNATPMP {
-        log.Println("Starting NATPMP...")
-        PackSettings.SetBool("enable_natpmp", true)
-    }
-    session.ApplySettings(PackSettings)
-    for p := range mappedPorts {
-		port, _ := strconv.Atoi(p)
-		mappedPorts[p] = session.AddPortMapping(lt.SessionHandleTcp, port, port)
-		log.Printf("Adding port mapping %v: %v", port, mappedPorts[p])
+	if config.enableDHT {
+		bootstrapNodes := ""
+		if config.dhtRouters != "" {
+            bootstrapNodes = config.dhtRouters + "," + strings.Join(dhtBootstrapNodes, ",")
+		} else {
+			bootstrapNodes = strings.Join(dhtBootstrapNodes, ",")
+		}
+		if bootstrapNodes != "" {
+			log.Println("starting DHT...")
+			packSettings.SetStr("dht_bootstrap_nodes", bootstrapNodes)
+			packSettings.SetBool("enable_dht", true)
+		}
 	}
-    
+	if config.enableLSD {
+		log.Println("starting LSD...")
+		packSettings.SetBool("enable_lsd", true)
+	}
+	if config.enableUPNP {
+		log.Println("starting UPNP...")
+		packSettings.SetBool("enable_upnp", true)
+	}
+	if config.enableNATPMP {
+		log.Println("starting NATPMP...")
+		packSettings.SetBool("enable_natpmp", true)
+	}
+
+	session.ApplySettings(packSettings)
+    for p := range mappedPorts {
+        port, _ := strconv.Atoi(p)
+        mappedPorts[p] = session.AddPortMapping(lt.WrappedSessionHandleTcp, port, port)
+        log.Printf("Adding port mapping %v: %v", port, mappedPorts[p])
+	}
 }
 
 func startSession() {
@@ -852,18 +851,21 @@ func startSession() {
 
 	// Bools
 	settings.SetBool("announce_to_all_tiers", true)
-	settings.SetBool("announce_to_all_trackers", false)
+	settings.SetBool("announce_to_all_trackers", true)
 	settings.SetBool("apply_ip_filter_to_trackers", false)
 	settings.SetBool("lazy_bitfields", true)
 	settings.SetBool("no_atime_storage", true)
 	settings.SetBool("no_connect_privileged_ports", false)
-	settings.SetBool("prioritize_partial_pieces", false)
+	settings.SetBool("prioritize_partial_pieces", config.prioritizePartialPieces)
 	settings.SetBool("rate_limit_ip_overhead", false)
 	settings.SetBool("smooth_connects", false)
-	settings.SetBool("strict_end_game_mode", false)
+	settings.SetBool("strict_end_game_mode", config.strictEndGameMode)
 	settings.SetBool("upnp_ignore_nonrouters", true)
 	settings.SetBool("use_dht_as_fallback", false)
 	settings.SetBool("use_parole_mode", true)
+    settings.SetBool("ignore_limits_on_local_network", true)
+    settings.SetBool("free_torrent_hashes", true)
+    settings.SetBool("announce_double_nat", true)
 
 	// Disabling services, as they are enabled by default in libtorrent
 	settings.SetBool("enable_upnp", false)
@@ -871,11 +873,11 @@ func startSession() {
 	settings.SetBool("enable_lsd", false)
 	settings.SetBool("enable_dht", false)
 
-	// settings.SetInt("peer_tos", ipToSLowCost)
+	settings.SetInt("peer_tos", ipToSLowCost)
 	// settings.SetInt("torrent_connect_boost", 20)
 	// settings.SetInt("torrent_connect_boost", 100)
 	settings.SetInt("torrent_connect_boost", config.torrentConnectBoost)
-	settings.SetInt("aio_threads", runtime.NumCPU()*4)
+	//settings.SetInt("aio_threads", runtime.NumCPU()*4)
 	settings.SetInt("cache_size", -1)
 	settings.SetInt("mixed_mode_algorithm", int(lt.SettingsPackPreferTcp))
 
@@ -884,9 +886,12 @@ func startSession() {
 	settings.SetInt("auto_scrape_min_interval", 900)
 	settings.SetInt("min_announce_interval", 30)
 	settings.SetInt("dht_announce_interval", 60)
-	// settings.SetInt("peer_connect_timeout", 5)
-	// settings.SetInt("request_timeout", 2)
+	settings.SetInt("peer_connect_timeout", config.peerConnectTimeout)
+	settings.SetInt("request_timeout", config.requestTimeout)
+    settings.SetInt("min_reconnect_time", config.minReconnectTime)
+    settings.SetInt("dht_max_fail_count", config.maxFailCount)
 	settings.SetInt("stop_tracker_timeout", 1)
+    settings.SetInt("max_failcount", config.maxFailCount)
 
 	// Ratios
 	settings.SetInt("seed_time_limit", 0)
@@ -894,8 +899,10 @@ func startSession() {
 	settings.SetInt("share_ratio_limit", 0)
 
 	// Algorithms
-	settings.SetInt("choking_algorithm", int(lt.SettingsPackFixedSlotsChoker))
+	//settings.SetInt("choking_algorithm", int(lt.SettingsPackFixedSlotsChoker))
+    settings.SetInt("choking_algorithm", 0)
 	settings.SetInt("seed_choking_algorithm", int(lt.SettingsPackFastestUpload))
+    //settings.SetInt("seed_choking_algorithm", int(lt.SettingsPackRoundRobin))
 
 	// Sizes
 	settings.SetInt("request_queue_time", 2)
@@ -904,7 +911,7 @@ func startSession() {
 	// settings.SetInt("max_out_request_queue", 60000)
 	// settings.SetInt("max_allowed_in_request_queue", 25000)
 	// settings.SetInt("listen_queue_size", 2000)
-	// settings.SetInt("unchoke_slots_limit", 20)
+	settings.SetInt("unchoke_slots_limit", 20)
 	settings.SetInt("max_peerlist_size", 50000)
 	settings.SetInt("dht_upload_rate_limit", 50000)
 	settings.SetInt("max_pex_peers", 200)
@@ -920,6 +927,7 @@ func startSession() {
     }
     if config.maxUploadRate >= 0 {
         settings.SetInt("upload_rate_limit", config.maxUploadRate * 1024)
+        settings.SetInt("choking_algorithm", int(lt.SettingsPackBittyrantChoker))
     }
 
 	// For Android external storage / OS-mounted NAS setups
@@ -928,7 +936,7 @@ func startSession() {
         settings.SetBool("use_read_cache", true)
         settings.SetBool("coalesce_reads", true)
         settings.SetBool("coalesce_writes", true)
-        settings.SetInt("max_queued_disk_bytes", 12*1024*1024)
+        settings.SetInt("max_queued_disk_bytes", 12 * 1024 * 1024)
     }
     
     if (config.connectionsLimit >= 0) {
@@ -960,9 +968,8 @@ func startSession() {
 	settings.SetInt("proxy_type", ProxyTypeNone)
 
 	// Set alert_mask here so it also applies on reconfigure...
-    settings.SetInt("alert_mask", int(
-        lt.AlertStorageNotification|
-        lt.AlertErrorNotification))
+    settings.SetInt("alert_mask", int(lt.AlertErrorNotification) | int(lt.AlertStorageNotification) |
+		int(lt.AlertTrackerNotification) | int(lt.AlertStatusNotification))
     
     if config.debugAlerts {
 		settings.SetInt("alert_mask", int(lt.AlertAllCategories))
@@ -975,7 +982,7 @@ func startSession() {
 	if config.randomPort {
         portLower = rand.Intn(16374)+49152
     }
-    portUpper := portLower + 10
+    portUpper := portLower + 5
     for p := portLower; p <= portUpper; p++ {
 		listenPorts = append(listenPorts, strconv.Itoa(p))
 	}
@@ -983,115 +990,315 @@ func startSession() {
     mappedPorts = map[string]int{}
     listenInterfacesStrings := make([]string, 0)
 	for _, listenInterface := range listenInterfaces {
-		port := listenPorts[rand.Intn(len(listenPorts))]
-		mappedPorts[port] = -1
-		listenInterfacesStrings = append(listenInterfacesStrings, listenInterface+":"+port)
-		if len(listenPorts) > 1 {
-			port := listenPorts[rand.Intn(len(listenPorts))]
-			mappedPorts[port] = -1
-			listenInterfacesStrings = append(listenInterfacesStrings, listenInterface+":"+port)
-		}
+        for i := range listenPorts {
+            port := listenPorts[i]
+            mappedPorts[port] = -1
+            listenInterfacesStrings = append(listenInterfacesStrings, listenInterface+":"+port)
+        }
 	}
 	settings.SetStr("listen_interfaces", strings.Join(listenInterfacesStrings, ","))
 	log.Printf("Listening on: %s", strings.Join(listenInterfacesStrings, ","))
     
     
-    //if config.Get().LibtorrentProfile == profileMinMemory {
+    //if config.LibtorrentProfile == profileMinMemory {
 		//log.Info("Setting Libtorrent profile settings to MinimalMemory")
 		//lt.MinMemoryUsage(settings)
-	//} else if config.Get().LibtorrentProfile == profileHighSpeed {
+	//} else if config.LibtorrentProfile == profileHighSpeed {
 		//log.Info("Setting Libtorrent profile settings to HighSpeed")
 		//lt.HighPerformanceSeed(settings)
 	//}
+    var err error
+    packSettings = settings
     
-    PackSettings = settings
-    
-    sessionglobal = lt.NewSession(PackSettings, int(lt.SessionHandleAddDefaultPlugins))
-    session = sessionglobal.GetHandle()
+    sessionglobal, err = lt.NewSession(packSettings, int(lt.WrappedSessionHandleAddDefaultPlugins))
+    if err != nil {
+		log.Printf("Could not create libtorrent session: %s", err)
+		return
+	}
+    session, err = sessionglobal.GetHandle()
+    if err != nil {
+		log.Printf("Could not create libtorrent session handle: %s", err)
+		return
+	}
+}
+
+func chooseFile() int {
+	biggestFileIndex := int(-1)
+	maxSize := int64(0)
+	numFiles := torrentInfo.NumFiles()
+	candidateFiles := make(map[int]bool)
+	files := torrentInfo.Files()
+
+	for i := 0; i < numFiles; i++ {
+		size := files.FileSize(i)
+		if size > maxSize {
+			maxSize = size
+			biggestFileIndex = i
+		}
+		if size > minCandidateSize {
+			candidateFiles[i] = true
+		}
+	}
+
+	log.Printf("there are %d candidate file(s)", len(candidateFiles))
+
+	if config.fileIndex >= 0 {
+		if _, ok := candidateFiles[config.fileIndex]; ok {
+			log.Printf("selecting requested file at position %d", config.fileIndex)
+			return config.fileIndex
+		}
+		log.Print("unable to select requested file")
+	}
+
+	log.Printf("selecting most biggest file (position:%d size:%dkB)", biggestFileIndex, maxSize/1024)
+	return biggestFileIndex
+}
+
+func pieceFromOffset(offset int64) (int, int64) {
+	pieceLength := int64(torrentInfo.PieceLength())
+	piece := int(offset / pieceLength)
+	pieceOffset := offset % pieceLength
+	return piece, pieceOffset
+}
+
+func getFilePiecesAndOffset(fe int) (int, int, int64) {
+	files := torrentInfo.Files()
+	startPiece, offset := pieceFromOffset(files.FileOffset(fe))
+	endPiece, _ := pieceFromOffset(files.FileOffset(fe) + files.FileSize(fe))
+	return startPiece, endPiece, offset
 }
 
 func addTorrent(torrentParams lt.AddTorrentParams) {
-    log.Println("Adding torrent")
-    error := lt.NewErrorCode()
-    torrentHandle = session.AddTorrent(torrentParams, error)
-    if error.Value() != 0 {
-        log.Fatalln(error.Message())
-    }
+	log.Println("adding torrent")
+    var err error
+	torrentHandle, err = session.AddTorrent(torrentParams)
+	if err != nil {
+        log.Printf("Error adding torrent: %s", err)
+	}
 
-    log.Println("Enabling sequential download")
-    torrentHandle.SetSequentialDownload(true)
+	log.Println("enabling sequential download")
+	torrentHandle.SetSequentialDownload(true)
+
+	trackers := defaultTrackers
+	if config.trackers != "" {
+		trackers = strings.Split(config.trackers, ",")
+	}
+	startTier := 256 - len(trackers)
+	for n, tracker := range trackers {
+		tracker = strings.TrimSpace(tracker)
+		announceEntry := lt.NewAnnounceEntry(tracker)
+		announceEntry.SetTier(byte(startTier + n))
+		log.Printf("adding tracker: %s", tracker)
+		torrentHandle.AddTracker(announceEntry)
+	}
+
+	if config.enableScrape {
+		log.Println("sending scrape request to tracker")
+		torrentHandle.ScrapeTracker()
+	}
+
+	log.Printf("downloading torrent: %s", torrentHandle.Status().GetName())
+	torrentFS = NewTorrentFS(torrentHandle, config.downloadPath)
+
+	if torrentHandle.Status().GetHasMetadata() {
+		onMetadataReceived()
+	}
+}
+
+func onMetadataReceived() {
+	log.Printf("metadata received")
+
+	torrentInfo = torrentHandle.TorrentFile()
+
+	fileEntryIdx = chooseFile()
+
+    numFiles := torrentInfo.NumFiles()
+    filepriorities := torrentHandle.FilePriorities()
+    defer lt.DeleteStdVectorInt(filepriorities)
     
-    trackers := DefaultTrackers
-    if config.trackers != "" {
-        moretrackers := strings.Split(config.trackers, ",")
-        for _, moretracker := range moretrackers {
-            trackers = append(trackers, moretracker)
+    if config.fileIndex == 9999 || config.fileIndex == -1 {
+        for i := 0; i < numFiles; i++ {
+            if config.fileIndex == 9999 {
+                filepriorities.Set(i, 4)
+            } else {
+                filepriorities.Set(i, 0)
+            }
+        }
+    } else {
+        for i := 0; i < numFiles; i++ {
+            if i == fileEntryIdx {
+                filepriorities.Set(i, 7)
+            } else {
+                filepriorities.Set(i, 0)
+            }
         }
     }
-    startTier := 256-len(trackers)
-    for n, tracker := range trackers {
-        tracker = strings.TrimSpace(tracker)
-        announceEntry := lt.NewAnnounceEntry(tracker)
-        announceEntry.SetTier(byte(startTier + n))
-        log.Printf("Adding tracker: %s", tracker)
-        torrentHandle.AddTracker(announceEntry)
+    torrentHandle.PrioritizeFiles(filepriorities)
+    if config.fileIndex == 9999 || config.fileIndex == -1 {
+        log.Printf("Not prioritizing pieces this time")
+    } else {
+        prioritizepieces()
     }
-
-    if config.enableScrape {
-        log.Println("Sending scrape request to tracker")
-        torrentHandle.ScrapeTracker()
-    }
-    
-    log.Printf("Downloading torrent: %s", torrentHandle.Status().GetName())
-    torrentFS = NewTorrentFS(torrentHandle, config.fileIndex, config.downloadStorage)
 }
+
+func prioritizepieces() {
+	log.Print("setting piece priorities")
+    torrentFS.muReaders.Lock()
+	pieceLength := float64(torrentInfo.PieceLength())
+	startPiece, endPiece, _ := getFilePiecesAndOffset(fileEntryIdx)
+
+	startLength := float64(endPiece-startPiece) * float64(pieceLength) * config.buffer
+	startBufferPieces := int(math.Ceil(startLength / pieceLength))
+	// Prefer a fixed size, since metadata are very rarely over endPiecesSize=10MB anyway.
+	endBufferPieces := int(math.Ceil(float64(endBufferSize) / pieceLength))
+
+	piecesPriorities := lt.NewStdVectorInt()
+	defer lt.DeleteStdVectorInt(piecesPriorities)
+
+	bufferPiecesProgressLock.Lock()
+	defer bufferPiecesProgressLock.Unlock()
+    torrentFS.muReaders.Unlock()
+//     if IsMemoryStorage() {
+//         ms = t.th.GetMemoryStorage().(lt.MemoryStorage)
+//         ms.SetTorrentHandle(t.th)
+// 
+// 		// Try to increase memory size to at most 25 pieces to have more comfortable playback.
+// 		// Also check for free memory to avoid spending too much!
+//         _, free := t.Service.GetMemoryStats()
+// 
+//         var newMemorySize int64
+//         for i := 25; i >= 10; i -= 5 {
+//             mem := int64(i) * t.pieceLength
+// 
+//             if mem < t.MemorySize || free == 0 {
+//                 break
+//             }
+//             if (mem-t.MemorySize)*2 < free {
+//                 newMemorySize = mem
+//                 break
+//             }
+//         }
+// 
+//         if newMemorySize > 0 {
+//             t.AdjustMemorySize(newMemorySize)
+//         }
+// 
+// 		// Increase memory size if buffer does not fit there
+// 		if preBufferSize+postBufferSize > t.MemorySize {
+// 			t.MemorySize = preBufferSize + postBufferSize + (1 * t.pieceLength)
+// 			log.Infof("Adjusting memory size to %s, to fit all buffer!", humanize.Bytes(uint64(t.MemorySize)))
+// 			t.ms.SetMemorySize(t.MemorySize)
+// 		}
+// 	}
+
+	// Properly set the pieces priority vector
+	curPiece := 0
+	for _ = 0; curPiece < startPiece; curPiece++ {
+		piecesPriorities.Add(0)
+	}
+	for _ = 0; curPiece < startPiece+startBufferPieces; curPiece++ { // get this part
+		piecesPriorities.Add(7)
+		bufferPiecesProgress[curPiece] = 0
+		torrentHandle.SetPieceDeadline(curPiece, 0, 0)
+	}
+	for _ = 0; curPiece < endPiece-endBufferPieces; curPiece++ {
+		piecesPriorities.Add(1)
+	}
+	for _ = 0; curPiece <= endPiece; curPiece++ { // get this part
+		piecesPriorities.Add(7)
+		bufferPiecesProgress[curPiece] = 0
+		torrentHandle.SetPieceDeadline(curPiece, 0, 0)
+	}
+	numPieces := torrentInfo.NumPieces()
+	for _ = 0; curPiece < numPieces; curPiece++ {
+		piecesPriorities.Add(0)
+	}
+	torrentHandle.PrioritizePieces(piecesPriorities)
+}
+
+func piecesProgress(pieces map[int]float64) {
+	queue := lt.NewStdVectorPartialPieceInfo()
+	defer lt.DeleteStdVectorPartialPieceInfo(queue)
+
+	torrentHandle.GetDownloadQueue(queue)
+	for piece := range pieces {
+		if torrentHandle.HavePiece(piece) == true {
+			pieces[piece] = 1.0
+		}
+	}
+	queueSize := queue.Size()
+	for i := 0; i < int(queueSize); i++ {
+		ppi := queue.Get(i)
+		pieceIndex := ppi.GetPieceIndex()
+		if _, exists := pieces[pieceIndex]; exists {
+			blocks := ppi.Blocks()
+			totalBlocks := ppi.GetBlocksInPiece()
+			totalBlockDownloaded := uint(0)
+			totalBlockSize := uint(0)
+			for j := 0; j < totalBlocks; j++ {
+				block := blocks.Getitem(j)
+				totalBlockDownloaded += block.GetBytesProgress()
+				totalBlockSize += block.GetBlockSize()
+			}
+			pieces[pieceIndex] = float64(totalBlockDownloaded) / float64(totalBlockSize)
+		}
+	}
+}
+
+// func (t *Torrent) AdjustMemorySize(ms int64) {
+// 	if t.ms == nil || t.ms.Swigcptr() == 0 {
+// 		return
+// 	}
+// 
+// 	defer perf.ScopeTimer()()
+// 
+// 	t.MemorySize = ms
+// 	log.Infof("Adjusting memory size to %s!", humanize.Bytes(uint64(t.MemorySize)))
+// 	t.ms.SetMemorySize(t.MemorySize)
+// }
 
 func IsMemoryStorage() bool {
-	return config.downloadStorage == 1
+	return true
 }
 
-func loop() {
-    forceShutdown = make(chan bool, 1)
-    signalChan := make(chan os.Signal, 1)
-    signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
-    statsTicker := time.Tick(5*time.Second)
-    saveResumeDataTicker := time.Tick(30*time.Second)
-    for {
-        select {
-        case <-forceShutdown:
-            httpListener.Close()
-            return
-        case <-signalChan:
-            forceShutdown <- true
-        case <-time.After(500*time.Millisecond):
-            consumeAlerts()
-            torrentFS.LoadFileProgress()
-            state := torrentHandle.Status().GetState()
-            if config.exitOnFinish && (state == STATE_FINISHED || state == STATE_SEEDING) {
-                forceShutdown <- true
-            }
-            if os.Getppid() == 1 {
-                forceShutdown <- true
-            }
-        case <-statsTicker:
-            stats()
-        case <-saveResumeDataTicker:
-            saveResumeData(true)
-        }
-    }
+func handleSignals() {
+	forceShutdown = make(chan bool, 1)
+	signalChan := make(chan os.Signal, 1)
+	saveResumeDataTicker := time.Tick(30 * time.Second)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+
+	for {
+		select {
+		case <-forceShutdown:
+			shutdown()
+			return
+		case <-signalChan:
+			forceShutdown <- true
+		case <-time.After(500 * time.Millisecond):
+			consumeAlerts()
+			state := torrentHandle.Status().GetState()
+			if config.exitOnFinish && (state == STATE_FINISHED || state == STATE_SEEDING) {
+				forceShutdown <- true
+			}
+			if os.Getppid() == 1 {
+				forceShutdown <- true
+			}
+		case <-saveResumeDataTicker:
+			saveResumeData(true)
+		}
+	}
 }
 
 func main() {
-    // Make sure we are properly multi-threaded, on a minimum of 2 threads
-    // because we lock the main thread for lt.
-    runtime.GOMAXPROCS(runtime.NumCPU())
-    config.parseFlags()
+	// Make sure we are properly multi-threaded, on a minimum of 2 threads
+	// because we lock the main thread for lt.
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	config.parseFlags()
 
-    startSession()
-    startServices()
-    addTorrent(buildTorrentParams(config.uri))
+	startSession()
+	startServices()
+	addTorrent(buildTorrentParams(config.uri))
 
-    startHTTP()
-    loop()
-    shutdown()
+	go handleSignals()
+	startHTTP()
 }

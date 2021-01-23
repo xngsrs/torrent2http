@@ -128,9 +128,9 @@ type SessionStatus struct {
 }
 
 const (
-	startBufferPercent = 0.005
+	startBufferPercent = 0.01
 	endBufferSize      = 10 * 1024 * 1024 // 10m
-	minCandidateSize   = 100 * 1024 * 1024
+	minCandidateSize   = 80 * 1024 * 1024
 	defaultDHTPort     = 6881
 )
 
@@ -149,6 +149,7 @@ var (
     ms                       lt.MemoryStorage
 	MemorySize               int64
 	mappedPorts              map[string]int
+	candidateFiles           map[int]bool
 )
 
 const (
@@ -227,6 +228,15 @@ func statusHandler(w http.ResponseWriter, _ *http.Request) {
         } else {
             statsesion = "running"
         }
+        seedsTotal := tstatus.GetNumComplete()
+        if seedsTotal <= 0 {
+            seedsTotal = tstatus.GetListSeeds()
+        }
+        peersTotal := tstatus.GetNumComplete() + tstatus.GetNumIncomplete()
+        if peersTotal <= 0 {
+            peersTotal = tstatus.GetListPeers()
+        }
+        peers := tstatus.GetNumPeers() - tstatus.GetNumSeeds() 
 		status = SessionStatus{
 			Name:          tstatus.GetName(),
 			State:         int(tstatus.GetState()),
@@ -237,10 +247,10 @@ func statusHandler(w http.ResponseWriter, _ *http.Request) {
 			TotalUpload:   tstatus.GetTotalUpload(),
 			DownloadRate:  float32(tstatus.GetDownloadPayloadRate()) / 1024,
 			UploadRate:    float32(tstatus.GetUploadPayloadRate()) / 1024,
-			NumPeers:      tstatus.GetNumPeers(),
-			TotalPeers:    tstatus.GetNumIncomplete(),
+			NumPeers:      peers,
+			TotalPeers:    peersTotal,
 			NumSeeds:      tstatus.GetNumSeeds(),
-			TotalSeeds:    tstatus.GetNumComplete(),
+			TotalSeeds:    seedsTotal,
             HashString:    hex.EncodeToString([]byte(tstatus.GetInfoHash().ToString())),
             SessionStat:   statsesion}
 	}
@@ -298,14 +308,6 @@ func getHandler(h http.Handler) http.Handler {
                        torrentHandle.FilePriority(i, 0)
                    }
                }
-//                config.fileIndex = index
-//                onMetadataReceived()
-//             file := torrentInfo.Files().FilePath(index)
-//             if file != "" {
-//                 r.URL.Path = file
-//                 h.ServeHTTP(w, r)
-//                 return
-//             }
         }
         http.NotFound(w, r)
     })
@@ -851,7 +853,7 @@ func startSession() {
 
 	// Bools
 	settings.SetBool("announce_to_all_tiers", true)
-	settings.SetBool("announce_to_all_trackers", true)
+	settings.SetBool("announce_to_all_trackers", false)
 	settings.SetBool("apply_ip_filter_to_trackers", false)
 	settings.SetBool("lazy_bitfields", true)
 	settings.SetBool("no_atime_storage", true)
@@ -863,7 +865,6 @@ func startSession() {
 	settings.SetBool("upnp_ignore_nonrouters", true)
 	settings.SetBool("use_dht_as_fallback", false)
 	settings.SetBool("use_parole_mode", true)
-    settings.SetBool("ignore_limits_on_local_network", true)
     settings.SetBool("free_torrent_hashes", true)
     settings.SetBool("announce_double_nat", true)
 
@@ -873,11 +874,11 @@ func startSession() {
 	settings.SetBool("enable_lsd", false)
 	settings.SetBool("enable_dht", false)
 
-	settings.SetInt("peer_tos", ipToSLowCost)
+	//settings.SetInt("peer_tos", ipToSLowCost)
 	// settings.SetInt("torrent_connect_boost", 20)
 	// settings.SetInt("torrent_connect_boost", 100)
 	settings.SetInt("torrent_connect_boost", config.torrentConnectBoost)
-	//settings.SetInt("aio_threads", runtime.NumCPU()*4)
+	settings.SetInt("aio_threads", runtime.NumCPU()*4)
 	settings.SetInt("cache_size", -1)
 	settings.SetInt("mixed_mode_algorithm", int(lt.SettingsPackPreferTcp))
 
@@ -889,7 +890,6 @@ func startSession() {
 	settings.SetInt("peer_connect_timeout", config.peerConnectTimeout)
 	settings.SetInt("request_timeout", config.requestTimeout)
     settings.SetInt("min_reconnect_time", config.minReconnectTime)
-    settings.SetInt("dht_max_fail_count", config.maxFailCount)
 	settings.SetInt("stop_tracker_timeout", 1)
     settings.SetInt("max_failcount", config.maxFailCount)
 
@@ -899,8 +899,8 @@ func startSession() {
 	settings.SetInt("share_ratio_limit", 0)
 
 	// Algorithms
-	//settings.SetInt("choking_algorithm", int(lt.SettingsPackFixedSlotsChoker))
-    settings.SetInt("choking_algorithm", 0)
+	settings.SetInt("choking_algorithm", int(lt.SettingsPackFixedSlotsChoker))
+    //settings.SetInt("choking_algorithm", 0)
 	settings.SetInt("seed_choking_algorithm", int(lt.SettingsPackFastestUpload))
     //settings.SetInt("seed_choking_algorithm", int(lt.SettingsPackRoundRobin))
 
@@ -911,7 +911,7 @@ func startSession() {
 	// settings.SetInt("max_out_request_queue", 60000)
 	// settings.SetInt("max_allowed_in_request_queue", 25000)
 	// settings.SetInt("listen_queue_size", 2000)
-	settings.SetInt("unchoke_slots_limit", 20)
+	//settings.SetInt("unchoke_slots_limit", 20)
 	settings.SetInt("max_peerlist_size", 50000)
 	settings.SetInt("dht_upload_rate_limit", 50000)
 	settings.SetInt("max_pex_peers", 200)
@@ -945,25 +945,31 @@ func startSession() {
     settings.SetInt("connection_speed", config.connectionSpeed)
     
 	log.Println("Applying encryption settings...")
-	settings.SetInt("allowed_enc_level", int(lt.SettingsPackPeRc4))
-	settings.SetBool("prefer_rc4", true)
+    var policy int
+    var level int
+    var preferRc4 bool
     
-    if config.encryption != 2 {
-		policy := int(lt.SettingsPackPeDisabled)
-		level := int(lt.SettingsPackPeBoth)
-		preferRc4 := false
+    if config.encryption == 2 {
+		policy = int(lt.SettingsPackPeDisabled)
+		level = int(lt.SettingsPackPeBoth)
+		preferRc4 = false
+    }
+    if config.encryption == 1 {
+		policy = int(lt.SettingsPackPeEnabled)
+		level = int(lt.SettingsPackPeBoth)
+		preferRc4 = false
+    }
 
-		if config.encryption == 0 {
+    if config.encryption == 0 {
 			policy = int(lt.SettingsPackPeForced)
 			level = int(lt.SettingsPackPeRc4)
 			preferRc4 = true
-		}
-
-		settings.SetInt("out_enc_policy", policy)
-		settings.SetInt("in_enc_policy", policy)
-		settings.SetInt("allowed_enc_level", level)
-		settings.SetBool("prefer_rc4", preferRc4)
-	}
+    }
+    //log.Printf("Enc Policy: %d, allowed_enc_level: %d, prefer_rc4: %s", policy, level, preferRc4)
+    settings.SetInt("out_enc_policy", policy)
+    settings.SetInt("in_enc_policy", policy)
+    settings.SetInt("allowed_enc_level", level)
+    settings.SetBool("prefer_rc4", preferRc4)
 
 	settings.SetInt("proxy_type", ProxyTypeNone)
 
@@ -982,7 +988,7 @@ func startSession() {
 	if config.randomPort {
         portLower = rand.Intn(16374)+49152
     }
-    portUpper := portLower + 5
+    portUpper := portLower + 4
     for p := portLower; p <= portUpper; p++ {
 		listenPorts = append(listenPorts, strconv.Itoa(p))
 	}
@@ -1026,7 +1032,7 @@ func chooseFile() int {
 	biggestFileIndex := int(-1)
 	maxSize := int64(0)
 	numFiles := torrentInfo.NumFiles()
-	candidateFiles := make(map[int]bool)
+	candidateFiles = make(map[int]bool)
 	files := torrentInfo.Files()
 
 	for i := 0; i < numFiles; i++ {
@@ -1050,7 +1056,7 @@ func chooseFile() int {
 		log.Print("unable to select requested file")
 	}
 
-	log.Printf("selecting most biggest file (position:%d size:%dkB)", biggestFileIndex, maxSize/1024)
+	log.Printf("selecting biggest file (position:%d size:%dkB)", biggestFileIndex, maxSize/1024)
 	return biggestFileIndex
 }
 
@@ -1126,7 +1132,7 @@ func onMetadataReceived() {
         }
     } else {
         for i := 0; i < numFiles; i++ {
-            if i == fileEntryIdx {
+            if i == fileEntryIdx{
                 filepriorities.Set(i, 7)
             } else {
                 filepriorities.Set(i, 0)
@@ -1139,6 +1145,15 @@ func onMetadataReceived() {
     } else {
         prioritizepieces()
     }
+//     progresses := lt.NewStdVectorSizeType()
+//     files := torrentInfo.Files()
+//     defer lt.DeleteStdVectorSizeType(progresses)
+//     torrentHandle.FileProgress(progresses, int(lt.WrappedTorrentHandlePieceGranularity))
+//     download := progresses.Get(i)
+//     progress := float32(download)/float32(files.FileSize(i))
+//        if progress == 1{
+//            prioritizepieces()
+//        }
 }
 
 func prioritizepieces() {
@@ -1153,48 +1168,20 @@ func prioritizepieces() {
 	endBufferPieces := int(math.Ceil(float64(endBufferSize) / pieceLength))
 
 	piecesPriorities := lt.NewStdVectorInt()
-	defer lt.DeleteStdVectorInt(piecesPriorities)
+    defer lt.DeleteStdVectorInt(piecesPriorities)
 
 	bufferPiecesProgressLock.Lock()
 	defer bufferPiecesProgressLock.Unlock()
     torrentFS.muReaders.Unlock()
-//     if IsMemoryStorage() {
-//         ms = t.th.GetMemoryStorage().(lt.MemoryStorage)
-//         ms.SetTorrentHandle(t.th)
-// 
-// 		// Try to increase memory size to at most 25 pieces to have more comfortable playback.
-// 		// Also check for free memory to avoid spending too much!
-//         _, free := t.Service.GetMemoryStats()
-// 
-//         var newMemorySize int64
-//         for i := 25; i >= 10; i -= 5 {
-//             mem := int64(i) * t.pieceLength
-// 
-//             if mem < t.MemorySize || free == 0 {
-//                 break
-//             }
-//             if (mem-t.MemorySize)*2 < free {
-//                 newMemorySize = mem
-//                 break
-//             }
-//         }
-// 
-//         if newMemorySize > 0 {
-//             t.AdjustMemorySize(newMemorySize)
-//         }
-// 
-// 		// Increase memory size if buffer does not fit there
-// 		if preBufferSize+postBufferSize > t.MemorySize {
-// 			t.MemorySize = preBufferSize + postBufferSize + (1 * t.pieceLength)
-// 			log.Infof("Adjusting memory size to %s, to fit all buffer!", humanize.Bytes(uint64(t.MemorySize)))
-// 			t.ms.SetMemorySize(t.MemorySize)
-// 		}
-// 	}
 
 	// Properly set the pieces priority vector
 	curPiece := 0
 	for _ = 0; curPiece < startPiece; curPiece++ {
-		piecesPriorities.Add(0)
+        if _, ok := candidateFiles[fileEntryIdx]; ok {
+            piecesPriorities.Add(0)
+        } else {
+            piecesPriorities.Add(1)
+        }
 	}
 	for _ = 0; curPiece < startPiece+startBufferPieces; curPiece++ { // get this part
 		piecesPriorities.Add(7)
@@ -1211,9 +1198,17 @@ func prioritizepieces() {
 	}
 	numPieces := torrentInfo.NumPieces()
 	for _ = 0; curPiece < numPieces; curPiece++ {
-		piecesPriorities.Add(0)
+        if _, ok := candidateFiles[fileEntryIdx]; ok {
+            piecesPriorities.Add(0)
+        } else {
+            piecesPriorities.Add(1)
+        }
 	}
 	torrentHandle.PrioritizePieces(piecesPriorities)
+//     torrentHandle.ForceReannounce()
+// 	if config.enableDHT {
+// 		torrentHandle.ForceDhtAnnounce()
+// 	}
 }
 
 func piecesProgress(pieces map[int]float64) {
@@ -1244,18 +1239,6 @@ func piecesProgress(pieces map[int]float64) {
 		}
 	}
 }
-
-// func (t *Torrent) AdjustMemorySize(ms int64) {
-// 	if t.ms == nil || t.ms.Swigcptr() == 0 {
-// 		return
-// 	}
-// 
-// 	defer perf.ScopeTimer()()
-// 
-// 	t.MemorySize = ms
-// 	log.Infof("Adjusting memory size to %s!", humanize.Bytes(uint64(t.MemorySize)))
-// 	t.ms.SetMemorySize(t.MemorySize)
-// }
 
 func IsMemoryStorage() bool {
 	return true

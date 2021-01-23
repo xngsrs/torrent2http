@@ -42,7 +42,7 @@ type TorrentFile struct {
 	piecesLastUpdated time.Time
 	lastStatus        lt.TorrentStatus
 	closed            bool
-	savePath          string
+	path              string
 	
 	id                int64
 	readahead         int64
@@ -217,6 +217,7 @@ func NewTorrentFile(file http.File, tfs *TorrentFS, torrentInfo lt.TorrentInfo, 
 		pieceLength:  torrentInfo.PieceLength(),
 		fileOffset:   offset,
 		fileSize:     size,
+        path:         path,
         
         id:           time.Now().UTC().UnixNano(),
 
@@ -296,7 +297,7 @@ func (tf *TorrentFile) waitForPiece(piece int) error {
 
     defer perf.ScopeTimer()()
     tf.log("waiting for piece %d", piece)
-    tf.tfs.handle.PiecePriority(piece, 6)
+    tf.tfs.handle.PiecePriority(piece, 7)
     tf.tfs.handle.SetPieceDeadline(piece, 0)
 
     ticker := time.Tick(piecesRefreshDuration)
@@ -323,7 +324,7 @@ func (tf *TorrentFile) waitForPiece(piece int) error {
     _, endPiece := tf.getPieces()
     for i := piece+1; i < piece+4; i++ {
         if i < endPiece && !tf.hasPiece(i) {
-            tf.tfs.handle.PiecePriority(i, 6)
+            tf.tfs.handle.PiecePriority(i, 7)
             tf.tfs.handle.SetPieceDeadline(i, 0)
         }
     }
@@ -348,7 +349,7 @@ func (tf *TorrentFile) Read(data []byte) (n int, err error) {
         size := left
         
         if err = tf.waitForPiece(piece); err != nil {
-			log.Printf("Wait failed: %d", piece)
+			log.Printf("Wait failed: %d with status: %s", piece, err)
 			continue
 		}
     
@@ -455,8 +456,7 @@ func (tf *TorrentFile) Close() error {
     if tf.closed {
         return nil
     }
-    files := torrentInfo.Files()
-    tf.log("closing %s...", files.FilePath(fileEntryIdx))
+    tf.log("closing %s...", tf.path)
     tf.removed.Set()
     tf.tfs.muReaders.Lock()
 	delete(tf.tfs.readers, tf.id)

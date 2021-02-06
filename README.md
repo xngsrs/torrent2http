@@ -32,8 +32,10 @@ Command line options
 --------------------
 
       -bind="localhost:5001": Bind address of torrent2http
-      -connection-speed=50: The number of peer connection attempts that are made per second
-      -connections-limit=200: Set a global limit on the number of connections opened
+      -buffer=0.05: Buffer percentage from start of file
+      -cmdline-proc="": Display cmdline of specified process and exit
+      -connection-speed=250: The number of peer connection attempts that are made per second
+      -connections-limit=50: Set a global limit on the number of connections opened
       -debug-alerts=false: Show debug alert notifications
       -dht-routers="": Additional DHT routers (comma-separated host:port pairs)
       -dl-path=".": Download path
@@ -60,13 +62,16 @@ Command line options
       -overall-progress=false: Show overall progress
       -peer-connect-timeout=15: The number of seconds to wait after a connection attempt is initiated to a peer
       -pieces-progress=false: Show pieces progress
+      -prioritize-partial-pieces=false: Prioritize partial pieces vs rare pieces
       -random-port=false: Use random listen port (49152-65535)
-      -request-timeout=20: The number of seconds until the current front piece request will time out
+      -request-timeout=60: The number of seconds until the current front piece request will time out
       -resume-file="": Use fast resume file
       -show-stats=false: Show all stats (incl. -overall-progress -files-progress -pieces-progress)
       -state-file="": Use file for saving/restoring session state
+      -strict-end-game-mode=false: "Download same block from multiple peers if one is slow"
       -torrent-connect-boost=50: The number of peers to try to connect to immediately when the first tracker response is received for a torrent
       -trackers="": Additional trackers (comma-separated URLs)
+      -tuned-storage=false: Enable storage optimizations for Android external storage / OS-mounted NAS setups
       -ul-rate=-1: Max upload rate (kB/s)
       -uri="": Magnet URI or .torrent file URL
       -user-agent="torrent2http/1.0.1 libtorrent/1.0.3.0": Set an user agent

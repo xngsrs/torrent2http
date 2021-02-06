@@ -58,7 +58,7 @@ else ifeq ($(TARGET_OS), android)
 		GOARM =
 	endif
 	# GO_LDFLAGS += -extldflags=-pie
-	GO_LDFLAGS += -linkmode=external -extld=$(CC) -extldflags "-pie -lm -lc++_shared" 
+	GO_LDFLAGS += -linkmode=external -extld=$(CC) -extldflags "-pie -lm" 
 	# GO_LDFLAGS += -linkmode=external -extldflags "-pie"
 	CC := $(CROSS_ROOT)/bin/$(CROSS_TRIPLE)-clang
 	CXX := $(CROSS_ROOT)/bin/$(CROSS_TRIPLE)-clang++

@@ -15,18 +15,15 @@ import (
     "unsafe"
 
     lt "github.com/ElementumOrg/libtorrent-go"
-    "github.com/anacrolix/missinggo/perf"
 )
 
 const (
-    piecesRefreshDuration = 350 * time.Millisecond
+    piecesRefreshDuration = 500 * time.Millisecond
 )
 
 type TorrentFS struct {
 	handle   lt.TorrentHandle
 	Dir      http.Dir
-	readers  map[int64]*TorrentFile
-	muReaders *sync.Mutex
 }
 
 type TorrentFile struct {
@@ -44,14 +41,6 @@ type TorrentFile struct {
 	closed            bool
 	path              string
 	
-	id                int64
-	readahead         int64
-	
-	seeked            Event
-	removed           Event
-	
-	lastUsed          time.Time
-	isActive          bool
 }
 
 // PieceRange ...
@@ -63,16 +52,9 @@ func NewTorrentFS(handle lt.TorrentHandle, path string) *TorrentFS {
     tfs := TorrentFS{
         handle:   handle,
         Dir:      http.Dir(path),
-        readers:  map[int64]*TorrentFile{},
-        muReaders: &sync.Mutex{},
-        
     }
     return &tfs
 }
-
-var (
-	fileindex        int
-)
 
 func (tfs *TorrentFS) Open(uname string) (http.File, error) {
     name := DecodeFileURL(uname)
@@ -113,129 +95,19 @@ func (tfs *TorrentFS) Open(uname string) (http.File, error) {
     //return file, err
 }
 
-// GetReadaheadSize ...
-func (tfs *TorrentFS) GetReadaheadSize() (ret int64) {
-	defer perf.ScopeTimer()()
-
-	defaultRA := int64(50 * 1024 * 1024)
-	return defaultRA
-}
-
-// CloseReaders ...
-func (tfs *TorrentFS) CloseReaders() {
-	tfs.muReaders.Lock()
-	defer tfs.muReaders.Unlock()
-
-	for k, r := range tfs.readers {
-		log.Printf("Closing active reader: %d", r.id)
-		r.Close()
-		delete(tfs.readers, k)
-	}
-}
-
-// ResetReaders ...
-func (tfs *TorrentFS) ResetReaders() {
-	tfs.muReaders.Lock()
-	defer tfs.muReaders.Unlock()
-
-	if len(tfs.readers) == 0 {
-		return
-	}
-
-	perReaderSize := tfs.GetReadaheadSize()
-	countActive := float64(0)
-	countIdle := float64(0)
-	for _, r := range tfs.readers {
-		if r.IsActive() {
-			countActive++
-		} else {
-			countIdle++
-		}
-	}
-
-	sizeActive := int64(0)
-	sizeIdle := int64(0)
-
-	if countIdle > 1 {
-		countIdle = 2
-	}
-	if countActive > 1 {
-		countActive = 2
-	}
-
-	if countIdle > 0 {
-		sizeIdle = int64(float64(perReaderSize) * 0.33)
-		if countActive > 0 {
-			sizeActive = perReaderSize - sizeIdle
-		}
-	} else if countActive > 0 {
-		sizeActive = int64(float64(perReaderSize) / countActive)
-	}
-
-	if countActive == 0 && countIdle == 0 {
-		return
-	}
-
-	for _, r := range tfs.readers {
-		size := sizeActive
-		if !r.IsActive() {
-			size = sizeIdle
-		}
-
-		if r.readahead == size {
-			continue
-		}
-
-		//log.Printf("Setting readahead for reader %d", r.id)
-		r.readahead = size
-	}
-}
-
-// ReadersReadaheadSum ...
-func (tfs *TorrentFS) ReadersReadaheadSum() int64 {
-	tfs.muReaders.Lock()
-	defer tfs.muReaders.Unlock()
-
-	if len(tfs.readers) == 0 {
-		return 0
-	}
-
-	res := int64(0)
-	for _, r := range tfs.readers {
-		res += r.Readahead()
-	}
-
-	return res
-}
-
 func NewTorrentFile(file http.File, tfs *TorrentFS, torrentInfo lt.TorrentInfo, fileEntryIdx int, offset int64, size int64, path string) (*TorrentFile, error) {
-	tf := &TorrentFile{
-		File:         file,
-		tfs:          tfs,
-		torrentInfo:  torrentInfo,
-		fileEntryIdx: fileEntryIdx,
-		pieceLength:  torrentInfo.PieceLength(),
-		fileOffset:   offset,
-		fileSize:     size,
+    tf := &TorrentFile{
+        File:         file,
+        tfs:          tfs,
+        torrentInfo:  torrentInfo,
+        fileEntryIdx: fileEntryIdx,
+        pieceLength:  torrentInfo.PieceLength(),
+        fileOffset:   offset,
+        fileSize:     size,
         path:         path,
-        
-        id:           time.Now().UTC().UnixNano(),
-
-        lastUsed:     time.Now(),
-        isActive:     true,
-
-	}
-	if fileindex != fileEntryIdx {
-        tf.log("opening file %s", path)
     }
-    
-    tfs.muReaders.Lock()
-	tfs.readers[tf.id] = tf
-	tfs.muReaders.Unlock()
-
-	tfs.ResetReaders()
-    
-	return tf, nil
+    tf.log("opening file %s", path)
+    return tf, nil
 }
 
 func (tf *TorrentFile) log(message string, v ...interface{}) {
@@ -250,8 +122,7 @@ func (tf *TorrentFile) updatePieces() error {
     if time.Now().After(tf.piecesLastUpdated.Add(piecesRefreshDuration)) {
         // need to keep a reference to the status or else the pieces bitfield
         // is at risk of being collected
-        tf.GetLastStatus(true)
-        //tf.lastStatus = tf.tfs.handle.Status(uint(lt.WrappedTorrentHandleQueryPieces))
+        tf.lastStatus = tf.tfs.handle.Status(uint(lt.WrappedTorrentHandleQueryPieces))
         if tf.lastStatus.GetState() > lt.TorrentStatusSeeding {
             return errors.New("torrent file has invalid state")
         }
@@ -294,26 +165,15 @@ func (tf *TorrentFile) waitForPiece(piece int) error {
     if tf.hasPiece(piece) {
         return nil
     }
-
-    defer perf.ScopeTimer()()
     tf.log("waiting for piece %d", piece)
-    tf.tfs.handle.PiecePriority(piece, 7)
-    tf.tfs.handle.SetPieceDeadline(piece, 0)
+    for i := piece; i < piece+3; i++ {
+        tf.tfs.handle.SetPieceDeadline(i, i-piece*100, 0)
+    }
 
     ticker := time.Tick(piecesRefreshDuration)
-    removed := tf.removed.C()
-    seeked := tf.seeked.C()
     
     for tf.hasPiece(piece) == false {
         select {
-        case <-seeked:
-			tf.seeked.Clear()
-
-			log.Printf("Unable to wait for piece %d as file was seeked", piece)
-			return errors.New("File was seeked")
-        case <-removed:
-			log.Printf("Unable to wait for piece %d as file was closed", piece)
-			return errors.New("File was closed")
         case <-ticker:
             if tf.tfs.handle.PiecePriority(piece).(int) == 0 || tf.closed {
                 return errors.New("file was closed")
@@ -321,129 +181,105 @@ func (tf *TorrentFile) waitForPiece(piece int) error {
             continue
         }
     }
-    _, endPiece := tf.getPieces()
-    for i := piece+1; i < piece+4; i++ {
-        if i < endPiece && !tf.hasPiece(i) {
-            tf.tfs.handle.PiecePriority(i, 7)
-            tf.tfs.handle.SetPieceDeadline(i, 0)
-        }
-    }
     return nil
 }
 
 func (tf *TorrentFile) Read(data []byte) (n int, err error) {
-    defer perf.ScopeTimer()()
-    tf.SetActive(true)
-    
     currentOffset, err := tf.File.Seek(0, io.SeekCurrent)
     if err != nil {
         return 0, err
     }
-
+    
     left := len(data)
     pos := 0
-    
     piece, pieceOffset := tf.pieceFromOffset(currentOffset)
     
     for left > 0 && err == nil {
-        size := left
-        
-        if err = tf.waitForPiece(piece); err != nil {
+		size := left
+
+		if err = tf.waitForPiece(piece); err != nil {
 			log.Printf("Wait failed: %d with status: %s", piece, err)
 			continue
 		}
-    
-        if pieceOffset+size > tf.pieceLength {
-                size = tf.pieceLength - pieceOffset
-            }
-            
-        b := data[pos : pos+size]
-        n1 := 0
-        
-        n1, err = tf.File.Read(b)
-    
-    if err != nil {
-			if err == io.ErrShortBuffer {
-				log.Printf("Retrying to fetch piece: %d", piece)
-				err = nil
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-			return
-		} else if n1 > 0 {
-			n += n1
-			left -= n1
-			pos += n1
-
-			currentOffset += int64(n1)
-			piece, pieceOffset = tf.pieceFromOffset(currentOffset)
-		} else {
-			return
+		
+		if pieceOffset+size > tf.pieceLength {
+			size = tf.pieceLength - pieceOffset
 		}
-	}
-
-	return
+		
+		b := data[pos : pos+size]
+		n1 := 0
+		n1, err = tf.File.Read(b)
+        
+        if err != nil {
+            if err == io.ErrShortBuffer {
+                log.Printf("Retry to fetch piece: %d", piece)
+                err = nil
+                time.Sleep(500 * time.Millisecond)
+                continue
+            }
+            return
+        } else if n1 > 0 {
+            n += n1
+            left -= n1
+            pos += n1
+            
+            currentOffset += int64(n1)
+            piece, pieceOffset = tf.pieceFromOffset(currentOffset)
+        } else {
+            return
+        }
+    }
+    
+    return
 }
 
 func (tf *TorrentFile) Seek(offset int64, whence int) (int64, error) {
-    defer perf.ScopeTimer()()
-    tf.SetActive(true)
-    
     seekingOffset := offset
 
     switch whence {
-    case io.SeekStart:
-		for _, r := range tf.tfs.readers {
-			if r.id == tf.id {
-				continue
-			}
+        case io.SeekStart:
+            piece, _ := tf.pieceFromOffset(seekingOffset)
 
-			r.SetActive(false)
-		}
+            if tf.hasPiece(piece) == false {
+                tf.log("we don't have piece %d, setting piece priorities", piece)
+                piecesPriorities := lt.NewStdVectorInt()
+                defer lt.DeleteStdVectorInt(piecesPriorities)
 
-		piece, _ := tf.pieceFromOffset(seekingOffset)
-
-        if tf.hasPiece(piece) == false {
-            tf.log("we don't have piece %d, setting piece priorities", piece)
-            piecesPriorities := lt.NewStdVectorInt()
-            defer lt.DeleteStdVectorInt(piecesPriorities)
-
-            curPiece := 0
-            numPieces := tf.torrentInfo.NumPieces()
-            startPiece, endPiece := tf.getPieces()
-            buffPieces := int(math.Ceil(float64(endPiece-startPiece) * startBufferPercent))
-            if buffPieces == 0 {
-                buffPieces = 1
+                curPiece := 0
+                numPieces := tf.torrentInfo.NumPieces()
+                startPiece, endPiece := tf.getPieces()
+                buffPieces := int(math.Ceil(float64(endPiece-startPiece) * startBufferPercent))
+                if buffPieces == 0 {
+                    buffPieces = 1
+                }
+                if piece+buffPieces > endPiece {
+                    buffPieces = endPiece - piece
+                }
+                for _ = 0; curPiece < piece; curPiece++ {
+                    piecesPriorities.Add(0)
+                }
+                for _ = 0; curPiece < piece+buffPieces; curPiece++ { //highest priority for buffer
+                    piecesPriorities.Add(7)
+                    tf.tfs.handle.SetPieceDeadline(curPiece, 0, 0)
+                }
+                for _ = 0; curPiece <= endPiece; curPiece++ { // to the end of a file
+                    piecesPriorities.Add(1)
+                }
+                for _ = 0; curPiece < numPieces; curPiece++ {
+                    piecesPriorities.Add(0)
+                }
+                tf.tfs.handle.PrioritizePieces(piecesPriorities)
             }
-            if piece+buffPieces > endPiece {
-                buffPieces = endPiece - piece
+        case io.SeekCurrent:
+            currentOffset, err := tf.File.Seek(0, io.SeekCurrent)
+            if err != nil {
+                return currentOffset, err
             }
-            for _ = 0; curPiece < piece; curPiece++ {
-                piecesPriorities.Add(0)
-            }
-            for _ = 0; curPiece < piece+buffPieces; curPiece++ { //highest priority for buffer
-                piecesPriorities.Add(7)
-                tf.tfs.handle.SetPieceDeadline(curPiece, 0, 0)
-            }
-            for _ = 0; curPiece <= endPiece; curPiece++ { // to the end of a file
-                piecesPriorities.Add(1)
-            }
-            for _ = 0; curPiece < numPieces; curPiece++ {
-                piecesPriorities.Add(0)
-            }
-            tf.tfs.handle.PrioritizePieces(piecesPriorities)
-        }
-		break
-    case io.SeekCurrent:
-        currentOffset, err := tf.File.Seek(0, io.SeekCurrent)
-        if err != nil {
-            return currentOffset, err
-        }
-        seekingOffset += currentOffset
-        break
-    case io.SeekEnd:
-        seekingOffset = tf.fileSize - offset
-        break
+            seekingOffset += currentOffset
+            break
+        case io.SeekEnd:
+            seekingOffset = tf.fileSize - offset
+            break
     }
 
     tf.log("seeking at %d/%d", seekingOffset, tf.fileSize)
@@ -451,140 +287,16 @@ func (tf *TorrentFile) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (tf *TorrentFile) Close() error {
-    defer perf.ScopeTimer()()
-    
     if tf.closed {
         return nil
     }
     tf.log("closing %s...", tf.path)
-    tf.removed.Set()
-    tf.tfs.muReaders.Lock()
-	delete(tf.tfs.readers, tf.id)
-	tf.tfs.muReaders.Unlock()
 
-	defer tf.tfs.ResetReaders()
     tf.closed = true
     if tf.File == nil {
         return nil
     }
     return tf.File.Close()
-}
-
-func (tf *TorrentFile) ShowPieces() {
-    startPiece, endPiece := tf.getPieces()
-    str := ""
-    for i := startPiece; i <= endPiece; i++ {
-        if tf.pieces.GetBit(i) == false {
-            str += "-"
-        } else {
-            str += "#"
-        }
-    }
-    tf.log(str)
-}
-
-func (tf *TorrentFile) GetLastStatus(isForced bool) lt.TorrentStatus {
-	if !isForced && tf.lastStatus != nil && tf.lastStatus.Swigcptr() != 0 {
-		return tf.lastStatus
-	}
-
-	if tf.lastStatus != nil && tf.lastStatus.Swigcptr() != 0 {
-		lt.DeleteTorrentStatus(tf.lastStatus)
-	}
-
-	tf.lastStatus = tf.tfs.handle.Status(uint(lt.WrappedTorrentHandleQueryPieces))
-	return tf.lastStatus
-}
-
-// ReaderPiecesRange ...
-func (tf *TorrentFile) ReaderPiecesRange() (ret PieceRange) {
-	pos, _ := tf.Pos()
-	ra := tf.Readahead()
-
-	return tf.byteRegionPieces(tf.torrentOffset(pos), ra)
-}
-
-// Readahead returns current reader readahead
-func (tf *TorrentFile) Readahead() int64 {
-	ra := tf.readahead
-	if ra < 1 {
-		// Needs to be at least 1, because [x, x) means we don't want
-		// anything.
-		ra = 1
-	}
-	pos, _ := tf.Pos()
-	if tf.fileSize > 0 && ra > tf.fileSize-pos {
-		ra = tf.fileSize - pos
-	}
-	return ra
-}
-
-// Pos returns current file position
-func (tf *TorrentFile) Pos() (int64, error) {
-	return tf.File.Seek(0, io.SeekCurrent)
-}
-
-func (tf *TorrentFile) torrentOffset(readerPos int64) int64 {
-	return tf.fileOffset + readerPos
-}
-
-// Returns the range of pieces [begin, end) that contains the extent of bytes.
-func (tf *TorrentFile) byteRegionPieces(off, size int64) (pr PieceRange) {
-	if off >= tf.torrentInfo.TotalSize() {
-		return
-	}
-	if off < 0 {
-		size += off
-		off = 0
-	}
-	if size <= 0 {
-		return
-	}
-
-	pl := int64(tf.pieceLength)
-	pr.Begin = NumMax(0, int(off/pl))
-	pr.End = NumMin(tf.torrentInfo.NumPieces()-1, int((off+size-1)/pl))
-
-	return
-}
-
-// IsIdle ...
-func (tf *TorrentFile) IsIdle() bool {
-	return tf.lastUsed.Before(time.Now().Add(time.Minute * -1))
-}
-
-// IsActive ...
-func (tf *TorrentFile) IsActive() bool {
-	return tf.isActive
-}
-
-// SetActive ...
-func (tf *TorrentFile) SetActive(is bool) {
-	if is != tf.isActive {
-		defer tf.tfs.ResetReaders()
-	}
-
-	if is {
-		tf.lastUsed = time.Now()
-		tf.isActive = true
-	} else {
-		tf.isActive = false
-	}
-}
-
-func NumMin(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// Max ...
-func NumMax(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // DecodeFileURL decodes file path from url

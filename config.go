@@ -98,7 +98,7 @@ func (c Config) parseFlags() {
     flag.BoolVar(&config.enableUTP, "enable-utp", true, "Enable uTP protocol")
     flag.BoolVar(&config.enableTCP, "enable-tcp", true, "Enable TCP protocol")
     flag.BoolVar(&config.prioritizePartialPieces, "prioritize-partial-pieces", false, "Prioritize partial pieces vs rare pieces")
-    flag.BoolVar(&config.strictEndGameMode, "strict-end-game-mode", true, "Download same block from multiple peers if one is slow")
+    flag.BoolVar(&config.strictEndGameMode, "strict-end-game-mode", false, "Download same block from multiple peers if one is slow")
     flag.BoolVar(&config.tunedStorage, "tuned-storage", false, "Enable storage optimizations for Android external storage / OS-mounted NAS setups")
     flag.Float64Var(&config.buffer, "buffer", startBufferPercent, "Buffer percentage from start of file")
     flag.StringVar(&config.cmdlineProc, "cmdline-proc", "", "Display cmdline of specified process")

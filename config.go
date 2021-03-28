@@ -25,14 +25,14 @@ type Config struct {
     noSparseFile            bool
     idleTimeout             int
     peerConnectTimeout      int
-    requestTimeout     		int
+    requestTimeout          int
     torrentConnectBoost     int
     connectionSpeed         int
     listenPort              int
     minReconnectTime        int
     maxFailCount            int
     randomPort              bool
-    debugAlerts				bool
+    debugAlerts             bool
     showAllStats            bool
     showOverallProgress     bool
     showFilesProgress       bool
@@ -44,7 +44,7 @@ type Config struct {
     enableNATPMP            bool
     enableUTP               bool
     enableTCP               bool
-    exitOnFinish			bool
+    exitOnFinish            bool
     dhtRouters              string
     trackers                string
     buffer                  float64
@@ -53,6 +53,7 @@ type Config struct {
     downloadStorage         int
     prioritizePartialPieces bool
     strictEndGameMode       bool
+    subsFirst               bool
 }
 
 func (c Config) parseFlags() {
@@ -98,11 +99,12 @@ func (c Config) parseFlags() {
     flag.BoolVar(&config.enableUTP, "enable-utp", true, "Enable uTP protocol")
     flag.BoolVar(&config.enableTCP, "enable-tcp", true, "Enable TCP protocol")
     flag.BoolVar(&config.prioritizePartialPieces, "prioritize-partial-pieces", false, "Prioritize partial pieces vs rare pieces")
-    flag.BoolVar(&config.strictEndGameMode, "strict-end-game-mode", false, "Download same block from multiple peers if one is slow")
+    flag.BoolVar(&config.strictEndGameMode, "strict-end-game-mode", true, "Download same block from multiple peers if one is slow")
     flag.BoolVar(&config.tunedStorage, "tuned-storage", false, "Enable storage optimizations for Android external storage / OS-mounted NAS setups")
     flag.Float64Var(&config.buffer, "buffer", startBufferPercent, "Buffer percentage from start of file")
     flag.StringVar(&config.cmdlineProc, "cmdline-proc", "", "Display cmdline of specified process")
-    flag.IntVar(&config.downloadStorage, "down-storage", 0, "Download storage: 0=file storage 1=ram memory")
+    flag.BoolVar(&config.subsFirst, "subs-first", true, "Download subtitles first (not working for now)")
+    flag.IntVar(&config.downloadStorage, "down-storage", 0, "Download storage: 0=file storage 1=ram memory (not working for now)")
     flag.Parse()
 
     if config.uri == "" || config.cmdlineProc != "" {

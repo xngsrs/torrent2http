@@ -84,11 +84,22 @@ type FilesStatusInfo struct {
 }
 
 type FileStatusInfo struct {
-    Name     string  `json:"name"`
-    SavePath string  `json:"save_path"`
-    URL      string  `json:"url"`
-    Size     int64   `json:"size"`
-    Buffer   float64 `json:"bufferx"`
+    Name            string  `json:"name"`
+    SavePath        string  `json:"save_path"`
+    URL             string  `json:"url"`
+    Size            int64   `json:"size"`
+    Buffer          float64 `json:"bufferx"`
+    Download        int64   `json:"download"`
+    Progress        float32 `json:"progress"`
+    State           int     `json:"state"`
+    TotalDownload   int64   `json:"total_download"`
+    TotalUpload     int64   `json:"total_upload"`
+    DownloadRate    float32 `json:"download_rate"`
+    UploadRate      float32 `json:"upload_rate"`
+    NumPeers        int     `json:"num_peers"`
+    NumSeeds        int     `json:"num_seeds"`
+    TotalSeeds      int     `json:"total_seeds"`
+    TotalPeers      int     `json:"total_peers"`
 }
 
 type LsInfo struct {
@@ -102,7 +113,7 @@ type FileInfo struct {
 type PeerInfo struct {
     Ip             string  `json:"ip"`
     Flags          uint    `json:"flags"`
-    Source         uint     `json:"source"`
+    Source         uint    `json:"source"`
     UpSpeed        float32 `json:"up_speed"`
     DownSpeed      float32 `json:"down_speed"`
     TotalUpload    int64   `json:"total_upload"`
@@ -345,23 +356,28 @@ func lsHandler(w http.ResponseWriter, _ *http.Request) {
             filePriorities := torrentHandle.FilePriorities()
             progresses := lt.NewStdVectorSizeType()
             defer lt.DeleteStdVectorSizeType(progresses)
-            torrentHandle.FileProgress(progresses, int(lt.WrappedTorrentHandlePieceGranularity))
+            torrentHandle.FileProgress(progresses, 1)
             files := torrentInfo.Files()
             for i := 0; i < numFiles; i++ {
                 prio := filePriorities.Get(i)
                 download := progresses.Get(i)
-                progress := float32(download)/float32(files.FileSize(i))
+                size := files.FileSize(i)
+                progress := float32(download)/float32(size)
+                if math.IsNaN(float64(progress)) {
+                    progress = float32(0)
+                }
                 offset := files.FileOffset(i)
-                path, _ := filepath.Abs(path.Join(config.downloadPath, files.FilePath(i)))
+                pathname := files.FilePath(i)
+                path, _ := filepath.Abs(path.Join(config.downloadPath, pathname))
 
                 url := url.URL{
                     Host:   config.bindAddress,
-                    Path:   "/files/" + files.FilePath(i),
+                    Path:   "/files/" + pathname,
                     Scheme: "http",
                 }
                 fsi := FilesStatusInfo{
-                    Name:     files.FilePath(i),
-                    Size:     files.FileSize(i),
+                    Name:     pathname,
+                    Size:     size,
                     Offset:   offset,
                     Download: download,
                     Progress: progress,
@@ -403,21 +419,47 @@ func fileHandler(w http.ResponseWriter, _ *http.Request) {
                 }
                 bufferPiecesProgressLock.Unlock()
             }
-
+            progresses := lt.NewStdVectorSizeType()
+            defer lt.DeleteStdVectorSizeType(progresses)
+            torrentHandle.FileProgress(progresses, 1)
             files := torrentInfo.Files()
-            path, _ := filepath.Abs(path.Join(config.downloadPath, files.FilePath(fileEntryIdx)))
+            download := progresses.Get(fileEntryIdx)
+            size := files.FileSize(fileEntryIdx)
+            progress := float32(download)/float32(size)
+            name := files.FilePath(fileEntryIdx)
+            path, _ := filepath.Abs(path.Join(config.downloadPath, name))
+            seedsTotal := status.GetNumComplete()
+            if seedsTotal <= 0 {
+                seedsTotal = status.GetListSeeds()
+            }
+            peersTotal := status.GetNumComplete() + status.GetNumIncomplete()
+            if peersTotal <= 0 {
+                peersTotal = status.GetListPeers()
+            }
+            peers := status.GetNumPeers() - status.GetNumSeeds() 
 
             url := url.URL{
                 Host:   config.bindAddress,
-                Path:   "/files/" + files.FilePath(fileEntryIdx),
+                Path:   "/files/" + name,
                 Scheme: "http",
             }
             fsi := FileStatusInfo{
-                Buffer:   bufferProgress,
-                Name:     files.FilePath(fileEntryIdx),
-                Size:     files.FileSize(fileEntryIdx),
-                SavePath: path,
-                URL:      url.String(),
+                Buffer:         bufferProgress,
+                Name:           name,
+                Size:           size,
+                SavePath:       path,
+                URL:            url.String(),
+                Download:       download,
+                Progress:       progress,
+                State:          int(state),
+                TotalDownload:  status.GetTotalDownload(),
+                TotalUpload:    status.GetTotalUpload(),
+                DownloadRate:   float32(status.GetDownloadPayloadRate()) / 1024,
+                UploadRate:     float32(status.GetUploadPayloadRate()) / 1024,
+                NumPeers:       peers,
+                TotalPeers:     peersTotal,
+                NumSeeds:       status.GetNumSeeds(),
+                TotalSeeds:     seedsTotal,
             }
             retFiles.File = append(retFiles.File, fsi)
         }
@@ -493,28 +535,43 @@ func prioHandler(w http.ResponseWriter, r *http.Request) {
     index, err := strconv.Atoi(query.Get("index"))
     priority, err := strconv.Atoi(query.Get("priority"))
     if err == nil {
-        if index != fileEntryIdx{
-            files := torrentInfo.Files()
-            size := files.FileSize(index)
-            lastEntryIdx = fileEntryIdx
-            fileEntryIdx = index
-            torrentHandle.FilePriority(index, priority)
-            //torrentHandle.FilePriority(lastEntryIdx, 0)
-            ret = "File named: " + files.FilePath(index) + " is set with priority " + strconv.Itoa(priority)
-            if size > int64(10485760){
-                prioritizepieces()
+        if (index != fileEntryIdx) || (torrentHandle.FilePriority(index).(int) != priority){
+            if priority == 9999 {
+                numFiles := torrentInfo.NumFiles()
+                for i := 0; i < numFiles; i++ {
+                    torrentHandle.FilePriority(i, 4)
+                }
+                ret = "Started all files from torrent"
             } else {
-                curPiece := 0
-                numPieces := torrentInfo.NumPieces()
-                startpiece, endpiece, _ := getFilePiecesAndOffset(fileEntryIdx)
-                for _ = 0; curPiece < startpiece; curPiece++ {
-                    torrentHandle.PiecePriority(curPiece, 0)
-                }
-                for _ = 0; curPiece <= endpiece; curPiece++ { // get this part
-                    torrentHandle.PiecePriority(curPiece, 7)
-                }
-                for _ = 0; curPiece < numPieces; curPiece++ {
-                    torrentHandle.PiecePriority(curPiece, 0)
+                files := torrentInfo.Files()
+                size := files.FileSize(index)
+                lastEntryIdx = fileEntryIdx
+                fileEntryIdx = index
+                torrentHandle.FilePriority(index, priority)
+                //torrentHandle.FilePriority(lastEntryIdx, 0)
+                ret = "File named: " + files.FilePath(index) + " is set with priority " + strconv.Itoa(priority)
+                if size > int64(10485760){
+                    prioritizepieces()
+                } else {
+                    curPiece := 0
+                    numPieces := torrentInfo.NumPieces()
+                    startpiece, endpiece, _ := getFilePiecesAndOffset(fileEntryIdx)
+                    for _ = 0; curPiece < startpiece; curPiece++ {
+                        if torrentHandle.PiecePriority(curPiece).(int) > 0 {
+                            torrentHandle.PiecePriority(curPiece, 1)
+                            torrentHandle.SetPieceDeadline(curPiece, 1000)
+                        }
+                    }
+                    for _ = 0; curPiece <= endpiece; curPiece++ { // get this part
+                        torrentHandle.PiecePriority(curPiece, 7)
+                        torrentHandle.SetPieceDeadline(curPiece, 0)
+                    }
+                    for _ = 0; curPiece < numPieces; curPiece++ {
+                        if torrentHandle.PiecePriority(curPiece).(int) > 0 {
+                            torrentHandle.PiecePriority(curPiece, 1)
+                            torrentHandle.SetPieceDeadline(curPiece, 1000)
+                        }
+                    }
                 }
             }
         }
@@ -644,7 +701,7 @@ func removeTorrent() {
     var files []string
 
     state := torrentHandle.Status().GetState()
-    if state != STATE_CHECKING_FILES && state != STATE_QUEUED_FOR_CHECKING && !config.keepFiles {
+    if (state != STATE_CHECKING_FILES && state != STATE_QUEUED_FOR_CHECKING && !config.keepFiles) || forceshutdelete {
         if (!config.keepComplete && !config.keepIncomplete) || forceshutdelete {
             flag = int(lt.WrappedSessionHandleDeleteFiles)
         } else {
@@ -653,7 +710,7 @@ func removeTorrent() {
     }
     log.Println("removing the torrent")
     session.RemoveTorrent(torrentHandle, flag)
-    if flag != 0 || len(files) > 0 {
+    if (flag != 0) || (len(files) > 0) {
         log.Println("waiting for files to be removed")
         waitForAlert("torrent_deleted_alert", 15*time.Second)
         removeFiles(files)
@@ -704,6 +761,17 @@ func shutdown() {
         }
         log.Println("aborting the session")
         lt.DeleteSession(sessionglobal)
+    }
+    if forceshutdelete {
+        log.Println("deleting resume file")
+        path := config.resumeFile
+        if _, err := os.Stat(path); !os.IsNotExist(err) {
+            err := os.Remove(path)
+            if err != nil {
+                log.Println("error deleting resume file")
+                log.Println(err)
+            }
+        }
     }
     log.Println("bye bye")
     os.Exit(0)
@@ -1220,7 +1288,8 @@ func addTorrent(torrentParams lt.AddTorrentParams) {
     log.Println("enabling sequential download")
     torrentHandle.SetSequentialDownload(true)
 
-    trackers := defaultTrackers
+    //trackers := defaultTrackers
+    var trackers []string
     if config.trackers != "" {
         trackers = strings.Split(config.trackers, ",")
     }
